@@ -31,5 +31,5 @@ urls {
 }
 source-urls {
 # Download
-	"https://github.com/ablyssx74/rakarrack-haiku/archive/refs/tags/v1.0.0.tar.gz"
+	"https://github.com/ablyssx74/rakarrack-haiku-2011/archive/refs/tags/v$(VERSION)-$(REVISION).tar.gz"
 }

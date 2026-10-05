@@ -15,9 +15,13 @@ COPYRIGHT="2008-2011 Josep Andreu, Ryan Billing and others
 	2026 ablyss (Haiku port)"
 LICENSE="GNU GPL v2"
 REVISION="1"
-# Replace <commit> with the revision to package once it is pushed.
-SOURCE_URI="git+https://github.com/ablyssx74/rakarrack-haiku-2011.git#<commit>"
-SOURCE_DIR="rakarrack-haiku-2011"
+# Source is the GitHub tag v<version>-<revision>. Fill in CHECKSUM_SHA256 with
+#   sha256sum v0.6.2-1.tar.gz
+# of the tarball downloaded from that URL (GitHub strips the leading "v" from
+# the directory name inside it, hence SOURCE_DIR below).
+SOURCE_URI="https://github.com/ablyssx74/rakarrack-haiku-2011/archive/refs/tags/v$portVersion-$REVISION.tar.gz"
+CHECKSUM_SHA256="<sha256 of the tag tarball>"
+SOURCE_DIR="rakarrack-haiku-2011-$portVersion-$REVISION"
 
 ARCHITECTURES="all !x86_gcc2"
 SECONDARY_ARCHITECTURES=""
