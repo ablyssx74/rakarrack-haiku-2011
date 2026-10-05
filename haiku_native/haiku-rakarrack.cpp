@@ -1,0 +1,4228 @@
+/*
+ * Copyright 2026, ablyss hakarrack@epluribusunix.net
+ * All rights reserved. Distributed under the terms of the MIT license.
+ *
+ * Native Haiku GUI for Rakarrack.
+ *
+ * This mirrors the layout of the FLTK GUI (src/rakarrack.cxx) using native
+ * BeAPI/Haiku widgets: one "rack box" per effect, each with an On/Off
+ * checkbox and the effect's own sliders, laid out in a few scrollable
+ * columns. All effect parameters are read/written exclusively through each
+ * effect's public changepar()/getpar() API (or the equivalent
+ * *_Change()/getpar() pair used by Compressor and Gate) -- exactly how
+ * src/rakarrack.cxx itself talks to the engine. No engine header had to be
+ * modified to make this work.
+ */
+
+#include <app/Looper.h>
+#include <BufferProducer.h>
+#include <Application.h>
+#include <Message.h>
+#include <Archivable.h>
+#include <TimeSource.h>
+#include <MediaEventLooper.h>
+
+#include <OS.h>
+#include <syslog.h>
+#include <math.h>
+#include <Alert.h>
+
+#include <Alignment.h>
+#include <InterfaceDefs.h>
+#include <LayoutBuilder.h>
+#include <Box.h>
+#include <Button.h>
+#include <CheckBox.h>
+#include <ControlLook.h>
+#include <Entry.h>
+#include <FilePanel.h>
+#include <Font.h>
+#include <ListItem.h>
+#include <ListView.h>
+#include <Messenger.h>
+#include <Path.h>
+#include <String.h>
+#include <GroupView.h>
+#include <MenuBar.h>
+#include <MenuField.h>
+#include <MenuItem.h>
+#include <Message.h>
+#include <PopUpMenu.h>
+#include <Menu.h>
+#include <ScrollView.h>
+#include <Size.h>
+#include <SpaceLayoutItem.h>
+#include <StringView.h>
+#include <Slider.h>
+#include <StringView.h>
+#include <StatusBar.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <SupportDefs.h>
+#include <Window.h>
+#include <View.h>
+#include <pthread.h>
+
+#include <functional>
+#include <string>
+#include <deque>
+#include <vector>
+#include <map>
+
+// Pulls in the full RKR engine class (global.h) so we can call the real
+// effect objects' public parameter APIs directly -- the same interface
+// src/rakarrack.cxx itself uses. Nothing in this file touches a private
+// member of any effect class.
+#include "../src/global.h"
+
+#include "../src/rakarrack_haiku_bridge.h"
+
+// See rakarrack_haiku_bridge.h's own comment on the declaration -- defined
+// here (not main.C) purely so every target that links this file, extra/'s
+// tiny utilities included, has a real definition without needing a weak
+// fallback for it too.
+bool gAppQuitting = false;
+
+// This "weak" function satisfies the linker for small utilities
+// like rakverb, but gets overridden by the real one in the main app.
+__attribute__((weak)) void RKR::calculavol(int i) { }
+
+// haiku_native/haiku-rakarrack.o gets linked into more than just the main
+// "rakarrack" binary: the automake build also links it into the small
+// standalone utilities in extra/ (rakverb, rakverb2, rakconvert,
+// rakgit2new) via the shared $(LIBS) variable in haiku.makefile. Those
+// utilities only build their own tiny .C file plus this one -- none of
+// src/*.o (Distorsion.o, Echo.o, ...) is part of their link. Since this
+// file now drives every effect through its real changepar()/getpar() (or
+// Compressor_Change()/Gate_Change()) API instead of poking members
+// directly, the linker needs *something* to resolve those symbols to when
+// building those utilities. These weak fallbacks are never actually
+// reached at runtime there (those tools never call
+// start_haiku_native_interface()); the strong definitions in src/*.C
+// silently take over whenever this is linked into the real app, exactly
+// like the RKR::calculavol() stub above already does.
+__attribute__((weak)) void RKR::cleanup_efx() { }
+
+// Same story for loadfile()/savefile(): the real implementations live in
+// src/fileio.C (never linked into the small extra/ utilities), but this
+// file now calls them directly from the Save Preset/Load Preset buttons.
+__attribute__((weak)) void RKR::loadfile(char *filename) { }
+__attribute__((weak)) void RKR::savefile(char *filename) { }
+
+// MIDIConverter (the guitar-to-MIDI "MIDI" panel in the header, see
+// BuildHeader) isn't part of the changepar()/getpar() effect chain either --
+// same reasoning, same fix.
+__attribute__((weak)) void MIDIConverter::setmidichannel(int) { }
+__attribute__((weak)) void MIDIConverter::panic() { }
+__attribute__((weak)) void MIDIConverter::setTriggerAdjust(int) { }
+__attribute__((weak)) void MIDIConverter::setVelAdjust(int) { }
+
+#define RKR_HAIKU_WEAK_CHANGEPAR(EffectClass) \
+	__attribute__((weak)) void EffectClass::changepar(int, int) { } \
+	__attribute__((weak)) int EffectClass::getpar(int) { return 0; }
+
+RKR_HAIKU_WEAK_CHANGEPAR(Distorsion)
+RKR_HAIKU_WEAK_CHANGEPAR(NewDist)
+RKR_HAIKU_WEAK_CHANGEPAR(Echo)
+RKR_HAIKU_WEAK_CHANGEPAR(Reverb)
+RKR_HAIKU_WEAK_CHANGEPAR(EQ)
+RKR_HAIKU_WEAK_CHANGEPAR(Chorus)
+RKR_HAIKU_WEAK_CHANGEPAR(Phaser)
+RKR_HAIKU_WEAK_CHANGEPAR(Analog_Phaser)
+RKR_HAIKU_WEAK_CHANGEPAR(DynamicFilter)
+RKR_HAIKU_WEAK_CHANGEPAR(Alienwah)
+RKR_HAIKU_WEAK_CHANGEPAR(Valve)
+RKR_HAIKU_WEAK_CHANGEPAR(Ring)
+RKR_HAIKU_WEAK_CHANGEPAR(Sustainer)
+RKR_HAIKU_WEAK_CHANGEPAR(StompBox)
+RKR_HAIKU_WEAK_CHANGEPAR(Exciter)
+RKR_HAIKU_WEAK_CHANGEPAR(Vibe)
+RKR_HAIKU_WEAK_CHANGEPAR(Opticaltrem)
+RKR_HAIKU_WEAK_CHANGEPAR(Infinity)
+RKR_HAIKU_WEAK_CHANGEPAR(Pan)
+
+// Added when the remaining 25 effects were wired into native mode.
+// (Cabinet and EQ2 are both actually "class EQ *" in global.h -- see
+// efx_Cabinet/efx_EQ2 -- so they already resolve via RKR_HAIKU_WEAK_CHANGEPAR(EQ)
+// above and don't need their own entry here.)
+RKR_HAIKU_WEAK_CHANGEPAR(Convolotron)
+RKR_HAIKU_WEAK_CHANGEPAR(Looper)
+RKR_HAIKU_WEAK_CHANGEPAR(Sequence)
+RKR_HAIKU_WEAK_CHANGEPAR(StereoHarm)
+RKR_HAIKU_WEAK_CHANGEPAR(MBVvol)
+RKR_HAIKU_WEAK_CHANGEPAR(CoilCrafter)
+RKR_HAIKU_WEAK_CHANGEPAR(Reverbtron)
+RKR_HAIKU_WEAK_CHANGEPAR(MusicDelay)
+RKR_HAIKU_WEAK_CHANGEPAR(CompBand)
+RKR_HAIKU_WEAK_CHANGEPAR(Arpie)
+RKR_HAIKU_WEAK_CHANGEPAR(Vocoder)
+RKR_HAIKU_WEAK_CHANGEPAR(MBDist)
+RKR_HAIKU_WEAK_CHANGEPAR(Echotron)
+RKR_HAIKU_WEAK_CHANGEPAR(Harmonizer)
+RKR_HAIKU_WEAK_CHANGEPAR(Shifter)
+RKR_HAIKU_WEAK_CHANGEPAR(RyanWah)
+RKR_HAIKU_WEAK_CHANGEPAR(RBEcho)
+RKR_HAIKU_WEAK_CHANGEPAR(Synthfilter)
+RKR_HAIKU_WEAK_CHANGEPAR(ShelfBoost)
+RKR_HAIKU_WEAK_CHANGEPAR(Shuffle)
+RKR_HAIKU_WEAK_CHANGEPAR(Dflange)
+
+#undef RKR_HAIKU_WEAK_CHANGEPAR
+
+__attribute__((weak)) void Compressor::Compressor_Change(int, int) { }
+__attribute__((weak)) int Compressor::getpar(int) { return 0; }
+__attribute__((weak)) void Gate::Gate_Change(int, int) { }
+__attribute__((weak)) int Gate::getpar(int) { return 0; }
+
+// Expander uses Expander_Change() instead of changepar(), same pattern as
+// Compressor/Gate above.
+__attribute__((weak)) void Expander::Expander_Change(int, int) { }
+__attribute__((weak)) int Expander::getpar(int) { return 0; }
+
+// Same story again, this time for every effect's Preset dropdown (see
+// PresetMenuDef) -- setpreset() (and the Compressor/Gate/Expander
+// equivalents that don't use that name) are called directly from this file
+// now, so the small extra/ utilities need weak fallbacks for these too, on
+// top of changepar()/getpar() above.
+#define RKR_HAIKU_WEAK_SETPRESET(EffectClass) \
+	__attribute__((weak)) void EffectClass::setpreset(int) { }
+
+RKR_HAIKU_WEAK_SETPRESET(Exciter)
+RKR_HAIKU_WEAK_SETPRESET(Valve)
+RKR_HAIKU_WEAK_SETPRESET(Vibe)
+RKR_HAIKU_WEAK_SETPRESET(Pan)
+RKR_HAIKU_WEAK_SETPRESET(Reverbtron)
+RKR_HAIKU_WEAK_SETPRESET(MusicDelay)
+RKR_HAIKU_WEAK_SETPRESET(CompBand)
+RKR_HAIKU_WEAK_SETPRESET(Arpie)
+RKR_HAIKU_WEAK_SETPRESET(Vocoder)
+RKR_HAIKU_WEAK_SETPRESET(Analog_Phaser)
+RKR_HAIKU_WEAK_SETPRESET(Phaser)
+RKR_HAIKU_WEAK_SETPRESET(Opticaltrem)
+RKR_HAIKU_WEAK_SETPRESET(Infinity)
+RKR_HAIKU_WEAK_SETPRESET(MBDist)
+RKR_HAIKU_WEAK_SETPRESET(Echotron)
+RKR_HAIKU_WEAK_SETPRESET(Harmonizer)
+RKR_HAIKU_WEAK_SETPRESET(Shifter)
+RKR_HAIKU_WEAK_SETPRESET(ShelfBoost)
+RKR_HAIKU_WEAK_SETPRESET(Ring)
+RKR_HAIKU_WEAK_SETPRESET(Reverb)
+RKR_HAIKU_WEAK_SETPRESET(Alienwah)
+RKR_HAIKU_WEAK_SETPRESET(Echo)
+RKR_HAIKU_WEAK_SETPRESET(Sustainer)
+RKR_HAIKU_WEAK_SETPRESET(Synthfilter)
+RKR_HAIKU_WEAK_SETPRESET(Dflange)
+RKR_HAIKU_WEAK_SETPRESET(RyanWah)
+RKR_HAIKU_WEAK_SETPRESET(Shuffle)
+RKR_HAIKU_WEAK_SETPRESET(RBEcho)
+RKR_HAIKU_WEAK_SETPRESET(Convolotron)
+RKR_HAIKU_WEAK_SETPRESET(NewDist)
+RKR_HAIKU_WEAK_SETPRESET(StompBox)
+RKR_HAIKU_WEAK_SETPRESET(DynamicFilter)
+RKR_HAIKU_WEAK_SETPRESET(Looper)
+RKR_HAIKU_WEAK_SETPRESET(Sequence)
+RKR_HAIKU_WEAK_SETPRESET(StereoHarm)
+RKR_HAIKU_WEAK_SETPRESET(MBVvol)
+RKR_HAIKU_WEAK_SETPRESET(CoilCrafter)
+
+#undef RKR_HAIKU_WEAK_SETPRESET
+
+// Distorsion::setpreset() and Chorus::setpreset() take an extra "dgui"
+// selector arg -- Overdrive (also a Distorsion instance, see efx_Overdrive
+// in global.h) and Flanger (also a Chorus instance, see efx_Flanger) share
+// these same two stubs, not separate ones.
+__attribute__((weak)) void Distorsion::setpreset(int, int) { }
+__attribute__((weak)) void Chorus::setpreset(int, int) { }
+
+// Compressor/Gate/Expander's preset selector uses their own bespoke
+// *_Change_Preset() name instead of setpreset() -- same as their regular
+// parameter-change methods above.
+__attribute__((weak)) void Compressor::Compressor_Change_Preset(int, int) { }
+__attribute__((weak)) void Gate::Gate_Change_Preset(int) { }
+__attribute__((weak)) void Expander::Expander_Change_Preset(int) { }
+
+// EQ1/EQ2/Cabinet's presets are RKR-level free functions (see the
+// RKR::loadfile/savefile stubs above), not methods on the effect object.
+__attribute__((weak)) void RKR::EQ1_setpreset(int) { }
+__attribute__((weak)) void RKR::EQ2_setpreset(int) { }
+__attribute__((weak)) int RKR::Cabinet_setpreset(int) { return 0; }
+
+// Convolotron's setpresetPrefetch()/setpresetCommit()/prefetchIR()/
+// commitIR()/TakeSuppressedFileValue() (src/Convolotron.h) are called
+// directly from this file's Convolotron box (BuildColumn3) and Load Preset
+// handling (RakarrackWindow::HandleRefsReceived) for the same reason as
+// every stub above. SetSuppressFileLoad() needs no stub of its own -- it's
+// defined inline in the header, so it has no out-of-line symbol to miss.
+__attribute__((weak)) void Convolotron::setpresetPrefetch(int) { }
+__attribute__((weak)) void Convolotron::setpresetCommit() { }
+__attribute__((weak)) void Convolotron::prefetchIR(int) { }
+__attribute__((weak)) void Convolotron::commitIR() { }
+__attribute__((weak)) bool Convolotron::TakeSuppressedFileValue(int*) { return false; }
+
+// Same story for Reverbtron/Echotron -- the "Suction" bank preset (an
+// Echotron factory preset) flooding the audio backend exactly like an
+// unprotected Convolotron preset once did is what prompted giving both of
+// these the identical setpresetPrefetch()/setpresetCommit()/prefetchFile()/
+// commitFile()/TakeSuppressedFileValue() split (see Reverbtron.h/
+// Echotron.h). SetSuppressFileLoad() again needs no stub -- inline in the
+// header.
+__attribute__((weak)) void Reverbtron::setpresetPrefetch(int) { }
+__attribute__((weak)) void Reverbtron::setpresetCommit() { }
+__attribute__((weak)) void Reverbtron::prefetchFile(int) { }
+__attribute__((weak)) void Reverbtron::commitFile() { }
+__attribute__((weak)) bool Reverbtron::TakeSuppressedFileValue(int*) { return false; }
+__attribute__((weak)) void Echotron::setpresetPrefetch(int) { }
+__attribute__((weak)) void Echotron::setpresetCommit() { }
+__attribute__((weak)) void Echotron::prefetchFile(int) { }
+__attribute__((weak)) void Echotron::commitFile() { }
+__attribute__((weak)) bool Echotron::TakeSuppressedFileValue(int*) { return false; }
+
+// PERIOD (src/process.C) is a plain global, not a function -- same linking
+// problem, same fix: a weak fallback definition that the strong one in
+// process.C overrides whenever this file is linked into the real
+// "rakarrack" binary. ScopeView::Draw() is the only thing here that reads
+// it.
+extern int PERIOD;
+__attribute__((weak)) int PERIOD = 0;
+
+
+extern pthread_mutex_t jmutex;
+
+// Single message type for every control in the rack. "aidx" indexes into
+// RakarrackView::fActions; the value comes from "be:value" for sliders and
+// checkboxes, or from an explicit "val" field for menu items.
+//
+// MSG_OPEN_ORDER, MSG_SAVE_PRESET and MSG_LOAD_PRESET are deliberately NOT
+// part of this table: RakarrackWindow wraps every MSG_ACTION dispatch in
+// jmutex (the shared engine state most actions touch needs that), but
+// showing a window or a BFilePanel for the first time is real work (layout,
+// app_server round-trips) that has nothing to do with engine state --
+// holding jmutex for however long that takes was blocking the real-time
+// audio callback from acquiring it every ~2.7ms, starving playback (heard
+// as a flood of "SoundPlayNode::FillNextBuffer: RequestBuffer failed").
+// Routing these through their own messages keeps them out of that lock
+// entirely; the actual savefile()/loadfile() calls those panels lead to
+// (see RakarrackWindow) still take the lock explicitly, since those do
+// touch engine state the audio thread reads.
+// MSG_BANK_PRESET/MSG_RANDOM_PRESET (the header's Bank 1/2/3 dropdowns and
+// Random Preset button -- see BuildHeader) are ALSO deliberately outside
+// MSG_ACTION for a second reason on top of the one above: their handlers
+// (RakarrackView::ApplyBankPreset()/ApplyRandomPreset()) do their own
+// jmutex locking internally (via RunEngineActionFileSafe(), which needs
+// to unlock/relock partway through for Convolotron's sake -- see that
+// function's comment), so routing them through the already-locked
+// MSG_ACTION/Dispatch() path would deadlock this thread relocking a mutex
+// it already holds.
+enum {
+	MSG_ACTION = 'RKAx',
+	MSG_OPEN_ORDER = 'RKOo',
+	MSG_SAVE_PRESET = 'RKSp',
+	MSG_LOAD_PRESET = 'RKLp',
+	MSG_BANK_PRESET = 'RKBp',
+	MSG_RANDOM_PRESET = 'RKRp'
+};
+
+static const std::vector<std::string> kStompBoxModeNames = {
+	"Amp", "Grunge", "Rat", "Fat Cat", "Dist+", "Death", "Mid Elves Own", "Fuzz"
+};
+
+// The 30 waveshaper types shared by the Overdrive and Distortion effects
+// (both are instances of the Distorsion class) -- taken verbatim from
+// RKRGUI::menu_dist_tipo in src/rakarrack.cxx.
+static const std::vector<std::string> kDistTypeNames = {
+	"Atan", "Asym1", "Pow", "Sine", "Qnts", "Zigzg", "Lmt", "LmtU", "LmtL",
+	"ILmt", "Clip", "Asym2", "Pow2", "Sgm", "Crunch", "Hard Crunch",
+	"Dirty Octave+", "M.Square", "M.Saw", "Compress", "Overdrive", "Soft",
+	"Super Soft", "Hard Compress", "Lmt-NoGain", "FET", "DynoFET",
+	"Valve 1", "Valve 2", "Diode clipper"
+};
+
+// Shared dropdown lists for the effects added after the initial 21 -- each
+// taken verbatim from the matching RKRGUI::menu_* array in rakarrack.cxx,
+// reused across effects the same way it is there.
+static const std::vector<std::string> kLfoTypeNames = { // menu_chorus_lfotype
+	"Sine", "Tri", "Ramp Up", "Ramp Down", "ZigZag", "M. Sqare", "M.Saw",
+	"L. Fractal", "L. Fractal XY", "S/H Random", "-Sine +Tri", "-Tri +Sine"
+};
+static const std::vector<std::string> kSubDivNames = { // menu_arpie_subdiv
+	"1", "1/2", "1/3", "1/4", "1/5", "1/6"
+};
+static const std::vector<std::string> kMusDelayDiv7Names = { // menu_musdelay_delay3
+	"1", "1/2", "1/3", "1/4", "1/5", "1/6", "0"
+};
+static const std::vector<std::string> kArpiePatternNames = { // menu_arpie_pattern
+	"Ascending", "Descending", "UpDown", "Stutter", "Interrupted Descent",
+	"Double Descend"
+};
+static const std::vector<std::string> kCoilOriginNames = { // menu_coil_origin
+	"Off", "Fender Strat (old)", "Fender Strat (new)", "Squire Strat",
+	"Fender Hambucker", "Gibson P90", "Gibson Standard", "Gibson Mini",
+	"Gibson Super L6S"
+};
+static const std::vector<std::string> kMBVvolCombiNames = { // menu_mbvvol_combi
+	"1122", "1221", "1212", "o11o", "o12o", "x11x", "x12x", "1oo1", "1oo2",
+	"1xx1", "1xx2"
+};
+static const std::vector<std::string> kLooperBarNames = { // menu_looper_bar
+	"2/4", "3/4", "4/4", "5/4", "6/8", "7/8", "9/8", "11/8"
+};
+static const std::vector<std::string> kLooperMsNames = { "N", "H", "L" }; // menu_looper_ms
+static const std::vector<std::string> kSeqModeNames = { // menu_seq_mode
+	"Lineal", "UpDown", "Stepper", "Shifter", "Tremor", "Arpegiator", "Chorus",
+	"TrigStepper", "Seq Delay"
+};
+static const std::vector<std::string> kShifterModeNames = { "Trigger", "Whammy", "Portamento" }; // menu_shifter_mode
+// Tap Tempo source, in the order shown. The engine's Tap_Selection values
+// are 0=GUI, 1=MIDI Note On, 2=Jack Transport, 3=MIDI clock (0xF8), 4=Beat
+// Tracker; there is no JACK on Haiku so 2 is left out (see kTapSourceValues).
+static const std::vector<std::string> kTapSourceNames = {
+	"GUI", "MIDI Note On", "MIDI Clock", "Beat Tracker"
+};
+static const int32 kTapSourceValues[] = { 0, 1, 3, 4 };
+static const std::vector<std::string> kTapSetNames = { // menu_T_SET
+	"Dl. 1 LFO 1", "Dl. 1 LFO 1/2", "Dl. 1 LFO 1/3", "Dl. 1 LFO 1/4", "Dl. 1 LFO 1/8",
+	"Dl. 1/2 LFO 1", "Dl. 1/2 LFO 1/2", "Dl. 1/2 LFO 1/3", "Dl. 1/2 LFO 1/4", "Dl. 1/2 LFO 1/8",
+	"Dl. 1/3 LFO 1", "Dl. 1/3 LFO 1/2", "Dl. 1/3 LFO 1/3", "Dl. 1/3 LFO 1/4", "Dl. 1/3 LFO 1/8",
+	"Dl. 1/4 LFO 1", "Dl. 1/4 LFO 1/2", "Dl. 1/4 LFO 1/3", "Dl. 1/4 LFO 1/4", "Dl. 1/4 LFO 1/8",
+	"Dl. 1/8 LFO 1", "Dl. 1/8 LFO 1/2", "Dl. 1/8 LFO 1/3", "Dl. 1/8 LFO 1/4", "Dl. 1/8 LFO 1/8"
+};
+static const std::vector<std::string> kMIDIOctaveNames = { "-2", "-1", "0", "1", "2" }; // menu_MIDIOctave
+static const std::vector<std::string> kCCMapNames = { "Default", "MIDI Learn" }; // Mw0/Mw1
+
+// Built-in impulse-response/cabinet selectors for the three effects that can
+// also load a *custom* file via a Browse button in the FLTK GUI (Convol,
+// Reverbtron, Echotron) -- that file-chooser path isn't wired up here, but
+// these dropdowns (a plain changepar(8, ...) each) work standalone and give
+// full use of the built-in library.
+static const std::vector<std::string> kConvolIRNames = { // menu_convo_fnum
+	"Marshall JCM200", "Fender Superchamp", "Mesa Boogie", "Mesa Boogie 2",
+	"Marshall Plexi", "Bassman", "JCM2000", "Ampeg", "Marshall2"
+};
+static const std::vector<std::string> kReverbtronIRNames = { // menu_revtron_fnum
+	"Chamber", "Conc. Stair", "Hall", "Med Hall", "Large Room", "Large Hall",
+	"Guitar Ambience", "Studio", "Twilight", "Santa Lucia"
+};
+static const std::vector<std::string> kEchotronIRNames = { // menu_echotron_fnum
+	"SwingPong", "Short Delays", "Flange + Echo", "Comb", "EchoFlange",
+	"Filtered Echo", "Notch-Wah", "Multi-Chorus", "PingPong", "90-Shifter",
+	"Basic LR Delay"
+};
+
+// Built-in factory presets, one list per effect -- each taken verbatim from
+// the matching RKRGUI::menu_*_preset array in rakarrack.cxx (same order,
+// same labels) so "Preset N" here always means the same thing it does in
+// the FLTK GUI. See PresetMenuDef / BuildEffectBox's "preset" argument for
+// how these get wired up: unlike every other dropdown in this file, a
+// preset selection doesn't drive a single changepar() index -- it calls
+// the effect's own setpreset()-family method, which writes many parameters
+// at once from a table built into the effect class itself.
+static const std::vector<std::string> kExciterPresetNames = { // menu_exciter_preset
+	"Plain", "Loudness", "Exciter 1", "Exciter 2", "Exciter 3"
+};
+static const std::vector<std::string> kCompressorPresetNames = { // menu_compress_preset
+	"2:1", "4:1", "8:1"
+};
+static const std::vector<std::string> kValvePresetNames = { // menu_valve_preset
+	"Valve 1", "Valve 2", "Valve 3"
+};
+static const std::vector<std::string> kVibePresetNames = { // menu_vibe_preset
+	"Classic", "Stereo Classic", "Wide Vibe", "Classic Chorus",
+	"Vibe Chorus", "Lush Chorus", "Sick Phaser", "Warble"
+};
+static const std::vector<std::string> kPanPresetNames = { // menu_pan_preset
+	"AutoPan", "Extra Stereo"
+};
+static const std::vector<std::string> kReverbtronPresetNames = { // menu_revtron_preset
+	"Chamber", "Concrete Stairwell", "Hall", "Med Hall", "Room", "Hall",
+	"Guitar", "Studio", "Cathedral"
+};
+static const std::vector<std::string> kMusDelayPresetNames = { // menu_musdelay_preset
+	"Echo 1", "Echo 2"
+};
+static const std::vector<std::string> kCompBandPresetNames = { // menu_cband_preset
+	"Good Start", "Loudness", "Loudness 2"
+};
+static const std::vector<std::string> kEQ2PresetNames = { // menu_eqp_preset
+	"Plain", "Pop", "Jazz"
+};
+static const std::vector<std::string> kArpiePresetNames = { // menu_arpie_preset
+	"Arpie 1", "Arpie 2", "Arpie 3", "Simple Arpie", "Canyon",
+	"Panning Arpie 1", "Panning Arpie 2", "Panning Arpie 3",
+	"Feedback Arpie"
+};
+static const std::vector<std::string> kVocoderPresetNames = { // menu_vo_preset
+	"Vocoder 1", "Vocoder 2", "Vocoder 3", "Vocoder 4"
+};
+static const std::vector<std::string> kEQ1PresetNames = { // menu_eq_preset
+	"Plain", "Pop", "Jazz"
+};
+static const std::vector<std::string> kAPhaserPresetNames = { // menu_aphaser_preset
+	"Phaser 1", "Phaser 2", "Phaser 3", "Phaser 4", "Phaser 5", "Phaser 6"
+};
+static const std::vector<std::string> kPhaserPresetNames = { // menu_phaser_preset
+	"Phaser 1", "Phaser 2", "Phaser 3", "Phaser 4", "Phaser 5", "Phaser 6"
+};
+static const std::vector<std::string> kOverdrivePresetNames = { // menu_ovrd_preset
+	"Overdrive 1", "Overdrive 2"
+};
+static const std::vector<std::string> kOpticaltremPresetNames = { // menu_otrem_preset
+	"Fast", "Trem 2", "Hard Pan", "Soft Pan", "Ramp Down", "Hard Ramp"
+};
+static const std::vector<std::string> kMBDistPresetNames = { // menu_mbdist_preset
+	"Saturation", "Distorsion 1", "Soft", "Modulated", "Crunch",
+	"Distortion 2", "Distortion 3", "Distortion 4"
+};
+static const std::vector<std::string> kEchotronPresetNames = { // menu_echotron_preset
+	"Summer", "Ambience", "Arranjer", "Suction", "SuctionFlange"
+};
+static const std::vector<std::string> kDistorsionPresetNames = { // menu_dist_preset
+	"Distorsion 1", "Distorsion 2", "Distorsion 3", "Guitar Amp"
+};
+static const std::vector<std::string> kHarmonizerPresetNames = { // menu_har_preset
+	"Plain", "Octavator", "3m Down"
+};
+static const std::vector<std::string> kShifterPresetNames = { // menu_shifter_preset
+	"Fast", "Slow Up", "Slow Down", "Chorus", "Trig. Chorus"
+};
+static const std::vector<std::string> kShelfBoostPresetNames = { // menu_shelf_preset
+	"Trebble", "Mid", "Low", "Distortion 1"
+};
+static const std::vector<std::string> kCabinetPresetNames = { // menu_Cabinet_preset
+	"Marshall-4-12", "Celestion G12M", "Jensen Alnico P12N",
+	"Jensen Alnico P15N", "Delta Demon", "Celestion-EVH12",
+	"Eminence Copperhead", "Mesa Boogie", "Jazz-Chorus", "Vox-Bright",
+	"Marshall-I"
+};
+static const std::vector<std::string> kRingPresetNames = { // menu_ring_preset
+	"Saw_Sin", "E string", "A string", "Dissonance", "Fast Beat", "Ring Amp"
+};
+static const std::vector<std::string> kReverbPresetNames = { // menu_reverb_preset
+	"Cathedral 1", "Cathedral 2", "Cathedral 3", "Hall 1", "Hall 2",
+	"Room 1", "Room 2", "Basement", "Tunnel", "Echoed 1", "Echoed 2",
+	"Very Long 1", "Very Long 2"
+};
+static const std::vector<std::string> kFlangerPresetNames = { // menu_flanger_preset
+	"Flange 1", "Flange 2", "Flange 3", "Flange 4", "Flange 5"
+};
+static const std::vector<std::string> kAlienwahPresetNames = { // menu_Alienwah_preset
+	"AlienWah1", "AlienWah2", "AlienWah3", "AlienWah4"
+};
+static const std::vector<std::string> kEchoPresetNames = { // menu_echo_preset
+	"Echo 1", "Echo 2", "Echo 3", "Simple Echo", "Canyon", "Panning Echo 1",
+	"Panning Echo 2", "Panning Echo 3", "Feedback Echo"
+};
+static const std::vector<std::string> kSustainerPresetNames = { // menu_sus_preset
+	"Sustain 1", "Sustain 2", "Sustain 3"
+};
+static const std::vector<std::string> kSynthfilterPresetNames = { // menu_synthfilter_preset
+	"Low Pass", "High Pass", "Band Pass", "Lead Synth", "Water",
+	"Pan Filter", "Multi"
+};
+static const std::vector<std::string> kDFlangePresetNames = { // menu_dflange_preset
+	"Dual Flange 1", "Flange-Wah", "FbFlange", "SoftFlange", "Flanger",
+	"Deep Chorus", "Bright Chorus"
+};
+static const std::vector<std::string> kRyanWahPresetNames = { // menu_ryanwah_preset
+	"WahWah", "Mutron", "Phase Wah", "Phaser", "Quack Quack", "SmoothTron"
+};
+static const std::vector<std::string> kInfinityPresetNames = { // menu_infinity_preset
+	"Basic", "Rising Comb", "Falling Comb", "Laser", "Doppler", "Detune",
+	"Dizzy Sailor", "Stereo Phaser", "Corkscrew", "FreqeeVox"
+};
+static const std::vector<std::string> kShufflePresetNames = { // menu_shuffle_preset
+	"Shuffle 1", "Shuffle 2", "Shuffle 3", "Remover"
+};
+static const std::vector<std::string> kRBEchoPresetNames = { // menu_rbecho_preset
+	"Echo 1", "Echo 2", "Echo 3"
+};
+static const std::vector<std::string> kConvolotronPresetNames = { // menu_convo_preset
+	"Marshall JCM200", "Fender Superchamp", "Mesa Boogie", "Mesa Boogie 2"
+};
+static const std::vector<std::string> kNewDistPresetNames = { // menu_newdist_preset
+	"New Dist 1", "New Dist 2", "New Dist 3"
+};
+static const std::vector<std::string> kGatePresetNames = { // menu_gate_preset
+	"0dB", "-10dB", "-20dB"
+};
+static const std::vector<std::string> kChorusPresetNames = { // menu_chorus_preset
+	"Chorus 1", "Chorus 2", "Chorus 3", "Celeste 1", "Celeste 2"
+};
+static const std::vector<std::string> kStompBoxPresetNames = { // menu_stomp_preset
+	"Odie", "Grunger", "Hard Dist.", "Ratula", "Classic Dist",
+	"Morbid Impalement", "Sharp Metal", "Classic Fuzz"
+};
+static const std::vector<std::string> kWhaWhaPresetNames = { // menu_WhaWha_preset
+	"WahWah", "AutoWah", "Sweep", "VocalMorph1", "VocalMorph2"
+};
+static const std::vector<std::string> kLooperPresetNames = { // menu_looper_preset
+	"Looper", "Reverse"
+};
+static const std::vector<std::string> kSequencePresetNames = { // menu_seq_preset
+	"Jumpy", "Stair Step", "Mild", "Wah Wah", "Filter Pan", "Stepper",
+	"Shifter", "Zeke Trem", "Boogie", "Chorus"
+};
+static const std::vector<std::string> kStereoHarmPresetNames = { // menu_shar_preset
+	"Plain", "Octavator", "Chorus", "Hard Chorus"
+};
+static const std::vector<std::string> kMBVvolPresetNames = { // menu_mbvvol_preset
+	"VaryVol 1", "VaryVol 2", "VaryVol 3"
+};
+static const std::vector<std::string> kCoilCrafterPresetNames = { // menu_coil_preset
+	"H to S", "S to H"
+};
+static const std::vector<std::string> kExpanderPresetNames = { // menu_expander_preset
+	"Noise Gate", "Boost Gate", "Treble swell"
+};
+
+// One slider: on-screen label/range plus which changepar() index it drives.
+// "offset" is added to the raw UI value before it is sent to changepar(),
+// and subtracted back out when priming the slider from getpar() -- this is
+// how rakarrack.cxx itself maps its centered (-64..63 style) knobs onto the
+// 0..127-centered-on-64 values the engine expects.
+struct ParamDef {
+	const char* label;
+	int32 min;
+	int32 max;
+	int32 npar;
+	int32 offset;
+	// Set true only for a changepar() that's known to be genuinely
+	// expensive (e.g. Convolotron/Reverbtron/Echotron's "Length" -- these
+	// reprocess a whole impulse-response buffer synchronously). Such a
+	// slider is wired through AddDebouncedSlider() instead of AddSlider():
+	// the drag still moves and shows a value live, but the actual
+	// changepar() call is held until ~150ms after the last change instead
+	// of firing on every step, since each call blocks the real-time audio
+	// thread (which needs the same lock) for as long as it takes.
+	bool debounced = false;
+};
+
+// State for one AddDebouncedSlider() -- see that method and ParamDef's
+// "debounced" field.
+struct DebouncedSlider {
+	bool hasPending = false;
+	int32 pendingValue = 0;
+	bigtime_t lastChangeTime = 0;
+	std::function<void(int32)> apply;
+};
+
+// A plain on/off parameter (e.g. Pan's "Auto Pan" / "Extra On" flags).
+struct ToggleDef {
+	const char* label;
+	int32 npar;
+	// Nonzero: this toggle is one bit of a bit-field parameter (RyanWah's
+	// "Mode" holds M=1 and N=2 in the same changepar() value) instead of
+	// the whole value.
+	int32 mask = 0;
+};
+
+// A dropdown that drives a single changepar() index (an algorithm/mode/LFO
+// type). See PresetMenuDef below for the other kind of dropdown -- a
+// "Preset" selector that loads many params at once via setpreset().
+struct TypeMenuDef {
+	const char* label;
+	const std::vector<std::string>* items;
+	int32 npar;
+	int32 offset = 0; // added to the menu index before changepar(), subtracted
+	                  // back out when priming the initial selection from
+	                  // getFn() -- most of these dropdowns store the raw
+	                  // 0-based menu index, but a few (MusDelay's) store
+	                  // index+1 instead.
+};
+
+// The "Preset" dropdown -- distinct from TypeMenuDef because a preset
+// selection doesn't map onto a single changepar() index/value pair the way
+// every other dropdown in this file does. It calls the effect's own
+// setpreset()-family method instead (setpreset(), Compressor_Change_Preset(),
+// Gate_Change_Preset(), Expander_Change_Preset()...), which writes many
+// parameters at once from a table built into the effect class itself --
+// see src/fileio.C-adjacent *.C files' own setpreset() bodies. There's no
+// matching getpreset() to prime the dropdown's initial selection from (the
+// FLTK GUI doesn't try either -- its preset Fl_Choice always just opens on
+// its first item), so BuildEffectBox always marks index 0 initially,
+// regardless of what's actually loaded.
+struct PresetMenuDef {
+	const std::vector<std::string>* items = nullptr;
+	std::function<void(int32)> apply = nullptr;
+};
+
+// Color theme. Every themed color in this file is looked up by role
+// (ThemeRole) from gTheme instead of being a hard-coded constant. gTheme is
+// always built from the user's current system colors (Appearance
+// preferences) -- at startup (start_haiku_native_interface()) and again on
+// every live change (RakarrackWindow's B_COLORS_UPDATED handling). Nothing
+// is saved between runs: the app always just follows the system theme.
+//
+// Native BControls (BSlider, BCheckBox, BMenuField) render their frames,
+// knobs and native text with the system's current UI theme rather than fully
+// custom drawing the way FLTK's SliderW does, so this covers what Haiku's API
+// actually exposes: view/panel backgrounds and the text we draw ourselves
+// (titles, labels, values) -- not a pixel-exact reproduction of
+// rakarrack.cxx's skin.
+enum ThemeRole {
+	kRoleNone = -1,
+	kRoleBg = 0,   // window/column background
+	kRolePanel,    // effect box / slider row background
+	kRoleTitle,    // effect box titles (gold)
+	kRoleLabel,    // parameter labels (cyan)
+	kRoleValue,    // numeric readouts (near-white)
+	kRoleAccent,   // slider fill, scope trace
+	kThemeRoleCount
+};
+
+struct Theme {
+	rgb_color colors[kThemeRoleCount];
+
+	rgb_color operator[](ThemeRole role) const { return colors[role]; }
+};
+
+// The gold titles / cyan labels of src/rakarrack.cxx's own look. Titles and
+// labels start from these hues on any background; EnsureContrast() only
+// lightens or darkens them as far as needed to stay readable.
+static const rgb_color kTitleHue = { 224, 196, 132, 255 };
+static const rgb_color kLabelHue = { 140, 200, 224, 255 };
+
+// The theme currently in effect. Written only by the main window's thread
+// (BuildThemeFromSystemColors() before it exists, then its
+// B_COLORS_UPDATED handling); OrderWindow reads it from its own thread, but only right after
+// being told the theme changed (MSG_THEME_CHANGED) or while building itself,
+// and a torn read of a plain rgb_color would only ever be a momentarily
+// wrong shade anyway, never a crash.
+static Theme gTheme;
+
+static rgb_color ThemeColor(ThemeRole role)
+{
+	return gTheme[role];
+}
+
+// WCAG relative luminance/contrast ratio -- used so a theme derived from the
+// user's system colors keeps every piece of text we draw ourselves readable:
+// a dark background choice pushes text lighter, a light one pushes it darker.
+static float LinearChannel(uint8 value)
+{
+	float c = value / 255.0f;
+	return c <= 0.03928f ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f);
+}
+
+static float Luminance(rgb_color c)
+{
+	return 0.2126f * LinearChannel(c.red) + 0.7152f * LinearChannel(c.green)
+		+ 0.0722f * LinearChannel(c.blue);
+}
+
+static float ContrastRatio(rgb_color a, rgb_color b)
+{
+	float la = Luminance(a);
+	float lb = Luminance(b);
+	if (la < lb) {
+		float tmp = la;
+		la = lb;
+		lb = tmp;
+	}
+	return (la + 0.05f) / (lb + 0.05f);
+}
+
+// Linear blend of a toward b; t in [0, 1].
+static rgb_color MixColors(rgb_color a, rgb_color b, float t)
+{
+	rgb_color c;
+	c.red = (uint8)(a.red + (b.red - a.red) * t + 0.5f);
+	c.green = (uint8)(a.green + (b.green - a.green) * t + 0.5f);
+	c.blue = (uint8)(a.blue + (b.blue - a.blue) * t + 0.5f);
+	c.alpha = 255;
+	return c;
+}
+
+// Returns fg unchanged if it already reads well enough on bg; otherwise
+// blends it toward white (dark bg) or black (light bg) just far enough to
+// reach minRatio, so it keeps as much of its original hue as possible.
+static rgb_color EnsureContrast(rgb_color fg, rgb_color bg, float minRatio)
+{
+	if (ContrastRatio(fg, bg) >= minRatio)
+		return fg;
+	// 0.179 is the luminance at which white and black give equal contrast.
+	rgb_color target = Luminance(bg) < 0.179f
+		? make_color(255, 255, 255) : make_color(0, 0, 0);
+	for (int step = 1; step <= 20; step++) {
+		rgb_color c = MixColors(fg, target, step / 20.0f);
+		if (ContrastRatio(c, bg) >= minRatio)
+			return c;
+	}
+	return target;
+}
+
+// Builds the theme from the user's system colors. When called for a
+// B_COLORS_UPDATED message, colors carried in it (fields are named by
+// ui_color_name()) take precedence over ui_color(), in case the latter
+// hasn't caught up yet when the message arrives.
+//
+// Background comes straight from the panel background (Bg and Panel are the
+// same on purpose -- the space around the effect boxes reads as one
+// continuous surface with the boxes). Numeric readouts use the panel text
+// color, titles and labels the gold/cyan hues above, and the slider fill
+// the control highlight color. Every one of those is run through
+// EnsureContrast() against the background, so text on a dark theme gets
+// lighter and text on a light theme gets darker.
+static void BuildThemeFromSystemColors(Theme* theme, const BMessage* msg = NULL)
+{
+	rgb_color panelBg = ui_color(B_PANEL_BACKGROUND_COLOR);
+	rgb_color panelText = ui_color(B_PANEL_TEXT_COLOR);
+	rgb_color highlight = ui_color(B_CONTROL_HIGHLIGHT_COLOR);
+	if (msg != NULL) {
+		msg->FindColor(ui_color_name(B_PANEL_BACKGROUND_COLOR), &panelBg);
+		msg->FindColor(ui_color_name(B_PANEL_TEXT_COLOR), &panelText);
+		msg->FindColor(ui_color_name(B_CONTROL_HIGHLIGHT_COLOR), &highlight);
+	}
+
+	panelBg.alpha = 255;
+	theme->colors[kRoleBg] = panelBg;
+	theme->colors[kRolePanel] = panelBg;
+	// Readouts are the main body text, so they get the stricter 7:1 target;
+	// the colored titles/labels 4.5:1, and the slider fill (not text) 3:1.
+	theme->colors[kRoleValue] = EnsureContrast(panelText, panelBg, 7.0f);
+	theme->colors[kRoleTitle] = EnsureContrast(kTitleHue, panelBg, 4.5f);
+	theme->colors[kRoleLabel] = EnsureContrast(kLabelHue, panelBg, 4.5f);
+	theme->colors[kRoleAccent] = EnsureContrast(highlight, panelBg, 3.0f);
+}
+
+// Remembers which theme role(s) each view was colored with, so the whole
+// window can be recolored in place when the theme changes instead of being
+// rebuilt. One per window (RakarrackView owns the main window's, OrderWindow
+// its own), and only ever touched from that window's thread.
+class ThemeRegistry {
+public:
+	// Colors v now and remembers how. Any role may be kRoleNone to leave
+	// that color alone.
+	void Add(BView* v, ThemeRole viewRole, ThemeRole highRole = kRoleNone,
+		ThemeRole lowRole = kRoleNone)
+	{
+		Entry e = { v, NULL, viewRole, highRole, lowRole, kRoleNone };
+		_Apply(e);
+		fEntries.push_back(e);
+	}
+
+	void AddSlider(BSlider* s, ThemeRole viewRole, ThemeRole barRole)
+	{
+		Entry e = { s, s, viewRole, kRoleNone, kRoleNone, barRole };
+		_Apply(e);
+		fEntries.push_back(e);
+	}
+
+	// Recolors every registered view from gTheme and redraws it.
+	void Apply()
+	{
+		for (const Entry& e : fEntries) {
+			_Apply(e);
+			e.view->Invalidate();
+		}
+	}
+
+private:
+	struct Entry {
+		BView* view;
+		BSlider* slider;
+		ThemeRole viewRole;
+		ThemeRole highRole;
+		ThemeRole lowRole;
+		ThemeRole barRole;
+	};
+
+	// Always sets BOTH the view color and the low color explicitly, even
+	// when the caller only named one of them. Anything left unset would
+	// keep whatever it copied from its parent when it was first attached
+	// (AdoptParentColors()) -- right at startup, but never updated after
+	// that -- which is exactly what went wrong on a live color change:
+	// every BStringView (it paints its background with its view color) and
+	// every BSlider (it fills around the bar with its low color) kept a
+	// stale background until the app was restarted.
+	static void _Apply(const Entry& e)
+	{
+		ThemeRole bgRole = e.viewRole != kRoleNone ? e.viewRole : e.lowRole;
+		ThemeRole lowRole = e.lowRole != kRoleNone ? e.lowRole : e.viewRole;
+		if (bgRole != kRoleNone)
+			e.view->SetViewColor(ThemeColor(bgRole));
+		if (lowRole != kRoleNone)
+			e.view->SetLowColor(ThemeColor(lowRole));
+		if (e.highRole != kRoleNone)
+			e.view->SetHighColor(ThemeColor(e.highRole));
+		if (e.slider != NULL && e.barRole != kRoleNone)
+			e.slider->SetBarColor(ThemeColor(e.barRole));
+	}
+
+	std::vector<Entry> fEntries;
+};
+
+// A BCheckBox whose label is drawn in the theme's title color. Used as the
+// label view of every effect box (and the MIDI box) -- BBox accepts any view
+// as its label, so the effect's name and its on/off switch share the box's
+// top edge, the same way Haiku's Notifications preferences do it, instead
+// of a title plus a separate "On" row inside the box. A stock BCheckBox
+// always draws its label in the system's panel text color, which would lose
+// the gold titles, so Draw() is reimplemented with the same BControlLook
+// calls BCheckBox::Draw() makes, only passing an explicit text color.
+class TitleCheckBox : public BCheckBox {
+public:
+	TitleCheckBox(const char* name, const char* label, BMessage* message)
+		:
+		BCheckBox(name, label, message)
+	{
+		BFont font(be_bold_font);
+		SetFont(&font);
+	}
+
+	virtual void Draw(BRect updateRect)
+	{
+		rgb_color base = ui_color(B_PANEL_BACKGROUND_COLOR);
+		uint32 flags = be_control_look->Flags(this);
+
+		// Same geometry as BCheckBox's own (private) _CheckBoxFrame().
+		font_height fh;
+		GetFontHeight(&fh);
+		BRect boxRect(0.0f, 2.0f, ceilf(3.0f + fh.ascent),
+			ceilf(5.0f + fh.ascent));
+		be_control_look->DrawCheckBox(this, boxRect, updateRect, base, flags);
+
+		// As in BCheckBox::Draw(), the label isn't drawn as a control.
+		flags &= ~BControlLook::B_IS_CONTROL;
+
+		BRect labelRect(Bounds());
+		labelRect.left = boxRect.right + 1
+			+ be_control_look->DefaultLabelSpacing();
+		rgb_color textColor = ThemeColor(kRoleTitle);
+		be_control_look->DrawLabel(this, Label(), NULL, labelRect, updateRect,
+			ViewColor(), flags,
+			BAlignment(B_ALIGN_LEFT, B_ALIGN_VERTICAL_CENTER), &textColor);
+	}
+};
+
+// The shared audio engine (process.C) only ever walks the first 10 slots
+// of rkr->efx_order[] per callback -- an effect's own Bypass flag is
+// necessary but not sufficient for it to actually run: its effect-type ID
+// (the same numbers as the "case N:" labels in that switch) also has to be
+// sitting in one of those 10 slots. The FLTK GUI manages that through its
+// own "Effects Order" window (drag effects in/out of the active chain);
+// native mode has no such window, so each effect box claims its own slot
+// directly from its "On" toggle instead. This mirrors the same
+// 10-active-effects ceiling the FLTK GUI has always had -- it does not
+// remove it, just gives native mode its own way to work within it.
+//
+// Every slot ALWAYS holds a valid effect-type ID (0-45), the same way
+// FLTK's own Order window always names a real effect for each of its 10
+// positions (an inactive one just has its own Bypass off) -- there is no
+// "empty" sentinel. This isn't a style choice: src/fileio.C's savefile()
+// unconditionally writes one getbuf() line per slot, and getbuf()'s
+// switch has no case for an invalid ID -- for one it silently writes zero
+// bytes, not even a newline, which desyncs every line loadfile() reads
+// after that and corrupts the rest of the save file (confirmed against a
+// save made from here: a couple of real-looking lines, then cascading
+// garbage). An earlier version of this file used -1 for "no effect here"
+// and hit exactly that. So "inactive" here means only one thing: a slot
+// whose current occupant happens to have its own Bypass off, exactly
+// like FLTK.
+static const int kOrderSlotCount = 10;
+
+// Address of the RKR member that gates whether effectId's out()/changepar()
+// actually run -- one of 46 separately-named *_Bypass fields, since RKR has
+// no array indexable by effect-type ID. Only the ones ActivateEffectSlot()
+// and OrderWindow need to check generically are covered; everywhere else
+// each effect box already has its own bypass pointer passed to it directly
+// at construction. NULL for an ID this switch doesn't recognize.
+static int* BypassPtrForId(RKR* rkr, int effectId) {
+	switch (effectId) {
+	case 0: return &rkr->EQ1_Bypass;
+	case 1: return &rkr->Compressor_Bypass;
+	case 2: return &rkr->Distorsion_Bypass;
+	case 3: return &rkr->Overdrive_Bypass;
+	case 4: return &rkr->Echo_Bypass;
+	case 5: return &rkr->Chorus_Bypass;
+	case 6: return &rkr->Phaser_Bypass;
+	case 7: return &rkr->Flanger_Bypass;
+	case 8: return &rkr->Reverb_Bypass;
+	case 9: return &rkr->EQ2_Bypass;
+	case 10: return &rkr->WhaWha_Bypass;
+	case 11: return &rkr->Alienwah_Bypass;
+	case 12: return &rkr->Cabinet_Bypass;
+	case 13: return &rkr->Pan_Bypass;
+	case 14: return &rkr->Harmonizer_Bypass;
+	case 15: return &rkr->MusDelay_Bypass;
+	case 16: return &rkr->Gate_Bypass;
+	case 17: return &rkr->NewDist_Bypass;
+	case 18: return &rkr->APhaser_Bypass;
+	case 19: return &rkr->Valve_Bypass;
+	case 20: return &rkr->DFlange_Bypass;
+	case 21: return &rkr->Ring_Bypass;
+	case 22: return &rkr->Exciter_Bypass;
+	case 23: return &rkr->MBDist_Bypass;
+	case 24: return &rkr->Arpie_Bypass;
+	case 25: return &rkr->Expander_Bypass;
+	case 26: return &rkr->Shuffle_Bypass;
+	case 27: return &rkr->Synthfilter_Bypass;
+	case 28: return &rkr->MBVvol_Bypass;
+	case 29: return &rkr->Convol_Bypass;
+	case 30: return &rkr->Looper_Bypass;
+	case 31: return &rkr->RyanWah_Bypass;
+	case 32: return &rkr->RBEcho_Bypass;
+	case 33: return &rkr->CoilCrafter_Bypass;
+	case 34: return &rkr->ShelfBoost_Bypass;
+	case 35: return &rkr->Vocoder_Bypass;
+	case 36: return &rkr->Sustainer_Bypass;
+	case 37: return &rkr->Sequence_Bypass;
+	case 38: return &rkr->Shifter_Bypass;
+	case 39: return &rkr->StompBox_Bypass;
+	case 40: return &rkr->Reverbtron_Bypass;
+	case 41: return &rkr->Echotron_Bypass;
+	case 42: return &rkr->StereoHarm_Bypass;
+	case 43: return &rkr->CompBand_Bypass;
+	case 44: return &rkr->Opticaltrem_Bypass;
+	case 45: return &rkr->Vibe_Bypass;
+	case 46: return &rkr->Infinity_Bypass;
+	default: return nullptr;
+	}
+}
+
+// Effects whose on-screen controls get re-synced with the engine's actual
+// values after a Load Preset (see RakarrackView::fEffectRefreshers/
+// RefreshEffectBoxes() and RakarrackWindow::HandleRefsReceived()). Started
+// as just nine effects (Reverb, Cabinet, Valve, Expander, Convolotron,
+// CoilCrafter, ShelfBoost, StompBox, Reverbtron) to prove the mechanism out
+// before widening it -- now every effect BuildColumn1-4 wires up, since
+// each one's BuildEffectBox call already builds and registers its own
+// refresher unconditionally regardless of which effect it is (see that
+// function's "refreshers" comment), so covering the rest was just listing
+// the remaining IDs here, not new code. Same effect-type IDs as
+// BypassPtrForId()'s switch and EffectName() just above.
+static const std::vector<int> kPresetRefreshEffectIds = {
+	0,	// Equalizer
+	1,	// Compressor
+	2,	// Distortion
+	3,	// Overdrive
+	4,	// Echo
+	5,	// Chorus
+	6,	// Phaser
+	7,	// Flanger
+	8,	// Reverb
+	9,	// EQ2
+	10,	// WhaWha
+	11,	// Alienwah
+	12,	// Cabinet
+	13,	// Auto Pan
+	14,	// Harmonizer
+	15,	// MusDelay
+	16,	// Noise Gate
+	17,	// Derelict (NewDist)
+	18,	// Analog Phaser
+	19,	// Valve
+	20,	// DFlange
+	21,	// Ring Modulator
+	22,	// Exciter
+	23,	// MBDist
+	24,	// Arpie
+	25,	// Expander
+	26,	// Shuffle
+	27,	// Synthfilter
+	28,	// MBVvol
+	29,	// Convolotron
+	30,	// Looper
+	31,	// RyanWah
+	32,	// RBEcho
+	33,	// CoilCrafter
+	34,	// ShelfBoost
+	35,	// Vocoder
+	36,	// Sustainer
+	37,	// Sequence
+	38,	// Shifter
+	39,	// StompBox
+	40,	// Reverbtron
+	41,	// Echotron
+	42,	// StereoHarm
+	43,	// CompBand
+	44,	// Opticaltrem
+	45,	// Vibe
+	46,	// Infinity
+};
+
+// Runs `action` -- some engine mutation that ends up calling
+// RKR::Actualizar_Audio() (fileio.C: loadfile(), Bank_to_Preset(), New())
+// -- under jmutex, with Convolotron/Reverbtron/Echotron's own file-loading
+// changepar(8, ...) inside it deferred via each one's SetSuppressFileLoad()
+// (see Convolotron.h/Reverbtron.h/Echotron.h's identical comment on that)
+// exactly like their own per-effect Preset/IR dropdowns, so none of their
+// disk reads (or Convolotron's windowing pass) ever happen while jmutex --
+// which the real-time audio callback needs every ~PERIOD samples, see
+// jack.C -- is held. All three get this, not just whichever one a given
+// bank preset happens to use, since Actualizar_Audio() restores every
+// active effect in the chain in one pass and any of the three could be
+// among them. `action` itself must NOT lock jmutex; this acquires and
+// releases it.
+static void RunEngineActionFileSafe(RKR* rkr, std::function<void()> action)
+{
+	rkr->efx_Convol->SetSuppressFileLoad(true);
+	rkr->efx_Reverbtron->SetSuppressFileLoad(true);
+	rkr->efx_Echotron->SetSuppressFileLoad(true);
+	pthread_mutex_lock(&jmutex);
+	action();
+	pthread_mutex_unlock(&jmutex);
+	rkr->efx_Convol->SetSuppressFileLoad(false);
+	rkr->efx_Reverbtron->SetSuppressFileLoad(false);
+	rkr->efx_Echotron->SetSuppressFileLoad(false);
+
+	int fileValue;
+	if (rkr->efx_Convol->TakeSuppressedFileValue(&fileValue)) {
+		rkr->efx_Convol->prefetchIR(fileValue);
+		pthread_mutex_lock(&jmutex);
+		rkr->efx_Convol->commitIR();
+		pthread_mutex_unlock(&jmutex);
+	}
+	if (rkr->efx_Reverbtron->TakeSuppressedFileValue(&fileValue)) {
+		rkr->efx_Reverbtron->prefetchFile(fileValue);
+		pthread_mutex_lock(&jmutex);
+		rkr->efx_Reverbtron->commitFile();
+		pthread_mutex_unlock(&jmutex);
+	}
+	if (rkr->efx_Echotron->TakeSuppressedFileValue(&fileValue)) {
+		rkr->efx_Echotron->prefetchFile(fileValue);
+		pthread_mutex_lock(&jmutex);
+		rkr->efx_Echotron->commitFile();
+		pthread_mutex_unlock(&jmutex);
+	}
+}
+
+// BView::Hide()/Show() nest via a counter -- Hide() increments it, Show()
+// decrements it, and the view only actually draws once it's back at zero.
+// Calling either one when the view is already in that state overshoots
+// the counter, and a single later call the other way won't undo it: e.g.
+// two Hide()s in a row (counter 2) followed by one Show() (counter 1) is
+// still hidden. Found in practice as exactly this -- an effect box's body
+// (sliders/toggles/menus) getting stuck hidden after a couple of preset
+// loads left it inactive each time (each one a redundant Hide() on top of
+// the last, since nothing checked IsHidden() first), with the "On"
+// checkbox itself unaffected (SetValue() has no such nesting) so it kept
+// showing checked while its own body silently never came back. Every call
+// site that flips a view's visibility from a boolean goes through this
+// now instead of calling Hide()/Show() directly, so repeated calls with
+// an unchanged value are always safe no-ops.
+static void SetViewVisible(BView* view, bool visible) {
+	if (visible && view->IsHidden())
+		view->Show();
+	else if (!visible && !view->IsHidden())
+		view->Hide();
+}
+
+// Returns true if effectId is now (or already was) occupying a slot.
+// False means all 10 slots are held by other currently-active effects.
+static bool ActivateEffectSlot(RKR* rkr, int effectId) {
+	for (int i = 0; i < kOrderSlotCount; i++) {
+		if (rkr->efx_order[i] == effectId)
+			return true;
+	}
+	// Steal a slot from whichever occupant is currently bypassed -- its
+	// own state doesn't change, it just stops being one of the 10 in the
+	// chain. If that effect is turned on again later, it competes for a
+	// slot the same way any other effect does.
+	for (int i = 0; i < kOrderSlotCount; i++) {
+		int* occupantBypass = BypassPtrForId(rkr, rkr->efx_order[i]);
+		if (occupantBypass && *occupantBypass == 0) {
+			rkr->efx_order[i] = effectId;
+			return true;
+		}
+	}
+	return false;
+}
+
+// Deliberately does nothing: with no "empty" sentinel, turning an effect
+// off doesn't free its slot -- the slot keeps naming this effect (now
+// just bypassed, like any inactive FLTK Order-window entry) until some
+// other effect actually needs the slot and steals it in
+// ActivateEffectSlot(). The caller has already flipped *bypass to 0,
+// which is what actually silences it (see process.C's "if (X_Bypass)").
+static void DeactivateEffectSlot(RKR*, int) { }
+
+// Display name for each effect-type ID the native UI exposes -- every
+// effect BuildColumn1-4 wires up can end up in rkr->efx_order[], so this
+// needs to cover all 47, not just the original 21.
+static const char* EffectName(int effectId) {
+	switch (effectId) {
+	case 0: return "Equalizer";
+	case 1: return "Compressor";
+	case 2: return "Distortion";
+	case 3: return "Overdrive";
+	case 4: return "Echo";
+	case 5: return "Chorus";
+	case 6: return "Phaser";
+	case 7: return "Flanger";
+	case 8: return "Reverb";
+	case 9: return "EQ2";
+	case 10: return "WhaWha";
+	case 11: return "Alienwah";
+	case 12: return "Cabinet";
+	case 13: return "Auto Pan";
+	case 14: return "Harmonizer";
+	case 15: return "MusDelay";
+	case 16: return "Noise Gate";
+	case 17: return "Derelict";
+	case 18: return "Analog Phaser";
+	case 19: return "Valve";
+	case 20: return "DFlange";
+	case 21: return "Ring Modulator";
+	case 22: return "Exciter";
+	case 23: return "MBDist";
+	case 24: return "Arpie";
+	case 25: return "Expander";
+	case 26: return "Shuffle";
+	case 27: return "Synthfilter";
+	case 28: return "MBVvol";
+	case 29: return "Convolotron";
+	case 30: return "Looper";
+	case 31: return "RyanWah";
+	case 32: return "RBEcho";
+	case 33: return "CoilCrafter";
+	case 34: return "ShelfBoost";
+	case 35: return "Vocoder";
+	case 36: return "Sustainer";
+	case 37: return "Sequence";
+	case 38: return "Shifter";
+	case 39: return "StompBox";
+	case 40: return "Reverbtron";
+	case 41: return "Echotron";
+	case 42: return "StereoHarm";
+	case 43: return "CompBand";
+	case 44: return "Opticaltrem";
+	case 45: return "Vibe";
+	case 46: return "Infinity";
+	default: return "(unknown)";
+	}
+}
+
+// A small window listing the currently-active effects (those with a claimed
+// chain slot -- see ActivateEffectSlot()) in their actual processing order,
+// top to bottom, with Move Up/Move Down buttons to reorder them. This is
+// native mode's answer to rakarrack.cxx's drag-and-drop "Effects Order"
+// window: a plain BListView instead of a real drag target, since order
+// only ever needs a swap between two slots and buttons get that exactly
+// right without any native drag-and-drop code to get subtly wrong.
+enum {
+	MSG_ORDER_UP = 'RKOu',
+	MSG_ORDER_DOWN = 'RKOd',
+	MSG_ORDER_CLOSE = 'RKOc',
+	// Sent by the main window to this one after gTheme changes (see
+	// RakarrackWindow's B_COLORS_UPDATED handling) -- this window only
+	// recolors itself once the main window has finished deriving and
+	// saving the new theme, not on its own copy of B_COLORS_UPDATED,
+	// whose arrival order relative to the main window's isn't defined.
+	MSG_THEME_CHANGED = 'RKTc'
+};
+
+class OrderWindow : public BWindow {
+public:
+	OrderWindow(RKR* rkr)
+		:
+		// Wide/tall enough on first open for the hint text to wrap onto its
+		// two full lines and for "Move Up"/"Move Down"/"Close" to all sit on
+		// one row without the list's scrollbar crowding "Close" off the
+		// right edge -- the original 300x320 was too small for that (see
+		// the "before" screenshot in the session that added this comment).
+		BWindow(BRect(160, 160, 680, 580), "Effects Order", B_TITLED_WINDOW,
+			B_ASYNCHRONOUS_CONTROLS | B_NOT_ZOOMABLE),
+		fRkr(rkr)
+	{
+		// BWindow has no SetViewColor() of its own (unlike BView) -- give it
+		// a single real BView child to carry the background color instead,
+		// same as RakarrackWindow's scroller/content already do. This has
+		// to be a plain BView, not another BGroupView: a BGroupView already
+		// sets up and owns its own BGroupLayout, and running
+		// BLayoutBuilder::Group<> on it too (below) fights that existing
+		// layout instead of using it -- nothing ends up attached to
+		// anything that actually draws, which is why this showed up as a
+		// blank white window instead of the rack's dark theme.
+		SetLayout(new BGroupLayout(B_VERTICAL));
+		BView* background = new BView("bg", B_WILL_DRAW);
+		fTheme.Add(background, kRoleBg);
+		AddChild(background);
+
+		fList = new BListView("order_list", B_SINGLE_SELECTION_LIST);
+		fTheme.Add(fList, kRolePanel, kRoleValue, kRolePanel);
+		BScrollView* listScroll = new BScrollView("order_scroll", fList, 0,
+			false, true);
+
+		BStringView* hint = new BStringView("hint",
+			"Only effects you've turned on appear here. This is the order "
+			"they process your signal in, top to bottom.");
+		fTheme.Add(hint, kRoleNone, kRoleLabel, kRoleBg);
+		hint->SetFontSize(10.5f);
+
+		BButton* upBtn = new BButton("up", "Move Up",
+			new BMessage(MSG_ORDER_UP));
+		BButton* downBtn = new BButton("down", "Move Down",
+			new BMessage(MSG_ORDER_DOWN));
+		BButton* closeBtn = new BButton("close", "Close",
+			new BMessage(MSG_ORDER_CLOSE));
+
+		BLayoutBuilder::Group<>(background, B_VERTICAL, 8)
+			.SetInsets(10)
+			.Add(hint)
+			.Add(listScroll)
+			.AddGroup(B_HORIZONTAL, 6)
+				.Add(upBtn)
+				.Add(downBtn)
+				.AddGlue()
+				.Add(closeBtn)
+			.End()
+		.End();
+
+		SetSizeLimits(420, 6000, 340, 6000);
+		RefreshList();
+	}
+
+	virtual void MessageReceived(BMessage* msg)
+	{
+		switch (msg->what) {
+		case MSG_ORDER_UP:
+			MoveSelected(-1);
+			break;
+		case MSG_ORDER_DOWN:
+			MoveSelected(1);
+			break;
+		case MSG_ORDER_CLOSE:
+			// Hide rather than Quit()/destroy -- see QuitRequested() below
+			// for why.
+			Hide();
+			break;
+		case MSG_THEME_CHANGED:
+			fTheme.Apply();
+			break;
+		default:
+			BWindow::MessageReceived(msg);
+			break;
+		}
+	}
+
+	// This window is never actually destroyed while the app runs -- it is
+	// created once, lazily, on the first "Effects Order..." click (see
+	// RakarrackView) and hidden/shown after that. A BApplication's default
+	// behavior is to quit once its window count reaches zero; that default
+	// has nothing to do with which window closed, so destroying even this
+	// one secondary window (via Quit()) while the main rack window was
+	// still open was enough to trip it and take the whole app down.
+	// Hiding instead of quitting means this window is never subtracted
+	// from that count in the first place.
+	//
+	// BUT that "hide, refuse" answer must not be unconditional: it's also
+	// exactly what BApplication::QuitRequested()'s default implementation
+	// asks every window (this one included) when the app is asked to quit
+	// as a whole -- Deskbar/ProcessController's "Quit Application", a
+	// session shutdown, B_QUIT_REQUESTED sent straight to the app. Once
+	// this window has been created at all (a single "Effects Order..."
+	// click, any time in the session), answering "no" there every single
+	// time would permanently veto the whole app's shutdown from then on --
+	// which is the exact bug this fixes. gAppQuitting (see
+	// rakarrack_haiku_bridge.h) is set by RakarrackApp::QuitRequested() in
+	// main.C before that cascade runs, so this only refuses the narrower,
+	// original case: the user closing just this one window on its own.
+	virtual bool QuitRequested()
+	{
+		if (gAppQuitting)
+			return true;
+		Hide();
+		return false;
+	}
+
+	// Called by RakarrackView every time it shows this window, since the
+	// active-effects list can have changed since it was last hidden.
+	void Refresh() { RefreshList(); }
+
+private:
+	// Rebuilds the visible list from rkr->efx_order[], skipping empty
+	// slots -- fSlotIndices[row] records which actual efx_order[] index
+	// that visible row came from, since gaps from effects turned off in
+	// between mean visible rows are not the same as raw slot indices.
+	void RefreshList()
+	{
+		int32 selRow = fList->CurrentSelection();
+		int selectedSlot = (selRow >= 0 && selRow < (int32)fSlotIndices.size())
+			? fSlotIndices[selRow] : -1;
+
+		while (fList->CountItems() > 0)
+			delete fList->RemoveItem((int32)0);
+		fSlotIndices.clear();
+
+		for (int i = 0; i < kOrderSlotCount; i++) {
+			int id = fRkr->efx_order[i];
+			// Every slot always names a real effect now (see the big
+			// comment above ActivateEffectSlot()) -- only show the ones
+			// actually turned on, matching the hint text above and what
+			// used to be conveyed by an empty slot.
+			int* bypass = BypassPtrForId(fRkr, id);
+			if (!bypass || *bypass == 0)
+				continue;
+			fList->AddItem(new BStringItem(EffectName(id)));
+			fSlotIndices.push_back(i);
+		}
+
+		for (size_t row = 0; row < fSlotIndices.size(); row++) {
+			if (fSlotIndices[row] == selectedSlot) {
+				fList->Select((int32)row);
+				break;
+			}
+		}
+	}
+
+	// Swaps the selected effect's actual efx_order[] slot with its
+	// immediate visible neighbor's -- locked the same way every other
+	// write to efx_order[] is (see ActivateEffectSlot/DeactivateEffectSlot)
+	// since jackprocess() reads this array on the audio thread every
+	// callback with no lock of its own around that read.
+	void MoveSelected(int direction)
+	{
+		int32 row = fList->CurrentSelection();
+		if (row < 0)
+			return;
+		int32 otherRow = row + direction;
+		if (otherRow < 0 || otherRow >= (int32)fSlotIndices.size())
+			return;
+
+		pthread_mutex_lock(&jmutex);
+		int a = fSlotIndices[row];
+		int b = fSlotIndices[otherRow];
+		int tmp = fRkr->efx_order[a];
+		fRkr->efx_order[a] = fRkr->efx_order[b];
+		fRkr->efx_order[b] = tmp;
+		pthread_mutex_unlock(&jmutex);
+
+		RefreshList();
+		fList->Select(otherRow);
+	}
+
+	RKR* fRkr;
+	BListView* fList;
+	std::vector<int> fSlotIndices;
+	ThemeRegistry fTheme;
+};
+
+// A stereo waveform view for the header -- a native port of src/rakarrack.cxx's
+// "Sco" (Scope) widget, the one that appears over the Tuner box there when its
+// title is clicked. It draws straight from the same two buffers the FLTK GUI
+// itself uses (rkr->anall/rkr->analr -- see Scope::init()'s call site in
+// rakarrack.cxx): PERIOD samples of the final, post-FX output, refreshed by
+// the real-time audio callback every buffer. Unlike rakarrack.cxx, this is
+// always visible here (no click-to-reveal toggle) rather than sharing screen
+// space with a Tuner box native mode doesn't have.
+//
+// Reads anall/analr with no lock, same as rakarrack.cxx's own Scope::draw()
+// -- the audio thread is free to be mid-memcpy into them on any given frame,
+// but a plain float read/write races only into torn *values* here (never a
+// crash, and self-correcting one frame later), the same tradeoff every VU
+// meter and scope in this codebase already makes for real-time-safe display
+// code.
+class ScopeView : public BView {
+public:
+	ScopeView(RKR* rkr)
+		:
+		BView("scope", B_WILL_DRAW | B_PULSE_NEEDED),
+		fRkr(rkr)
+	{
+		// No SetViewColor() -- Draw() fills the whole bounds itself from
+		// gTheme on every frame, so it follows a theme change for free.
+		SetViewColor(B_TRANSPARENT_COLOR);
+		SetExplicitMinSize(BSize(220, 60));
+		SetExplicitMaxSize(BSize(220, 60));
+	}
+
+	virtual void Pulse()
+	{
+		Invalidate();
+	}
+
+	virtual void Draw(BRect updateRect)
+	{
+		BRect b = Bounds();
+		// Frame and center line are faint tints of the value color over the
+		// panel color, so they stay visible on light and dark themes alike
+		// (on the baseline theme these land at the old fixed 70/50 grays).
+		rgb_color panel = ThemeColor(kRolePanel);
+		rgb_color value = ThemeColor(kRoleValue);
+		SetHighColor(panel);
+		FillRect(b);
+		SetHighColor(MixColors(panel, value, 0.2f));
+		StrokeRect(b);
+		SetHighColor(MixColors(panel, value, 0.1f));
+		StrokeLine(BPoint(b.Width() / 2.0f, b.top + 1),
+			BPoint(b.Width() / 2.0f, b.bottom - 1));
+
+		if (!fRkr || !fRkr->anall || !fRkr->analr || PERIOD <= 1)
+			return;
+
+		float gutter = 4.0f;
+		float halfW = (b.Width() - 3.0f * gutter) / 2.0f;
+		BRect left(b.left + gutter, b.top + 2, b.left + gutter + halfW, b.bottom - 2);
+		BRect right(left.right + gutter, left.top, left.right + gutter + halfW, left.bottom);
+		DrawChannel(fRkr->anall, left);
+		DrawChannel(fRkr->analr, right);
+	}
+
+private:
+	void DrawChannel(float* samples, BRect area)
+	{
+		SetHighColor(ThemeColor(kRoleAccent));
+		float midY = (area.top + area.bottom) / 2.0f;
+		float halfH = area.Height() / 2.0f;
+		float stepX = area.Width() / (float)PERIOD;
+		BPoint prev(area.left, midY);
+		// PERIOD can be a few thousand at low sample rates/large buffers --
+		// no need to plot every single sample when several land on the same
+		// pixel column, so stride through in ~1px steps instead of all of
+		// them.
+		int stride = (int)(1.0f / stepX);
+		if (stride < 1)
+			stride = 1;
+		for (int i = 0; i < PERIOD; i += stride) {
+			float v = samples[i];
+			if (v > 1.0f)
+				v = 1.0f;
+			else if (v < -1.0f)
+				v = -1.0f;
+			BPoint pt(area.left + i * stepX, midY - v * halfH);
+			if (i > 0)
+				StrokeLine(prev, pt);
+			prev = pt;
+		}
+	}
+
+	RKR* fRkr;
+};
+
+// A BSlider that also responds to the mouse wheel, one unit per notch --
+// landing a ~190px drag on one exact integer out of a wide range (Freq
+// Ceil's 50-5000, say) is imprecise; scrolling over it while the pointer
+// just sits there is not. Routed through the exact same Invoke() a normal
+// drag release already uses (BControl folds the current value in as
+// "be:value" automatically), so a wheel nudge goes through Bind()/
+// MakeMessage() exactly like any other value change -- the value label
+// updates immediately, same as dragging, with no separate code path to
+// keep in sync. AddSlider()/AddDebouncedSlider() build every slider in
+// the app as one of these, so this isn't MIDI-panel-specific.
+class WheelSlider : public BSlider {
+public:
+	WheelSlider(const char* name, BMessage* message, int32 minimum,
+		int32 maximum, orientation posture)
+		:
+		BSlider(name, NULL, message, minimum, maximum, posture),
+		fMin(minimum),
+		fMax(maximum)
+	{
+	}
+
+	virtual void MessageReceived(BMessage* msg)
+	{
+		if (msg->what == B_MOUSE_WHEEL_CHANGED) {
+			float dy = 0.0f;
+			msg->FindFloat("be:wheel_delta_y", &dy);
+			if (dy != 0.0f) {
+				int32 v = Value() + (dy < 0 ? 1 : -1);
+				if (v < fMin)
+					v = fMin;
+				if (v > fMax)
+					v = fMax;
+				if (v != Value()) {
+					SetValue(v);
+					Invoke();
+				}
+			}
+			return;
+		}
+		BSlider::MessageReceived(msg);
+	}
+
+private:
+	int32 fMin;
+	int32 fMax;
+};
+
+// Main rack content view: builds every effect box and owns the table of
+// callbacks ("actions") that the controls' messages are dispatched through.
+class RakarrackView : public BView {
+public:
+	RakarrackView(RKR* rkr)
+		:
+		BView("MainView", B_WILL_DRAW | B_PULSE_NEEDED),
+		fRkr(rkr)
+	{
+		// No setup needed for efx_order[] here -- the factory-default bank
+		// (loaded earlier, before this view exists) already leaves it at
+		// {0,1,...,9}, all with their own Bypass off, which is exactly
+		// what ActivateEffectSlot() needs: every slot names a real,
+		// currently-inactive effect, so the first thing turned on (in
+		// native mode, any of the 46, not just 0-9) immediately has a
+		// slot to steal. See the comment above ActivateEffectSlot() for
+		// why there's no "clear to empty" step the way there used to be.
+		fTheme.Add(this, kRoleBg);
+
+		// Four scrollable columns of effect racks (was five -- with each
+		// slider now ~2x as wide, four fits comfortably on more screens),
+		// mirroring the layout of src/rakarrack.cxx without trying to
+		// reproduce its exact pixel geometry.
+		BGroupView* col1 = new BGroupView(B_VERTICAL, 8);
+		BGroupView* col2 = new BGroupView(B_VERTICAL, 8);
+		BGroupView* col3 = new BGroupView(B_VERTICAL, 8);
+		BGroupView* col4 = new BGroupView(B_VERTICAL, 8);
+		col1->GroupLayout()->SetInsets(5);
+		col2->GroupLayout()->SetInsets(5);
+		col3->GroupLayout()->SetInsets(5);
+		col4->GroupLayout()->SetInsets(5);
+		fTheme.Add(col1, kRoleBg);
+		fTheme.Add(col2, kRoleBg);
+		fTheme.Add(col3, kRoleBg);
+		fTheme.Add(col4, kRoleBg);
+
+		BuildColumn1(col1);
+		BuildColumn2(col2);
+		BuildColumn3(col3);
+		BuildColumn4(col4);
+
+		col1->GroupLayout()->AddItem(BSpaceLayoutItem::CreateGlue());
+		col2->GroupLayout()->AddItem(BSpaceLayoutItem::CreateGlue());
+		col3->GroupLayout()->AddItem(BSpaceLayoutItem::CreateGlue());
+		col4->GroupLayout()->AddItem(BSpaceLayoutItem::CreateGlue());
+
+		BGroupView* columns = new BGroupView(B_HORIZONTAL, 8);
+		columns->GroupLayout()->SetInsets(10);
+		fTheme.Add(columns, kRoleBg);
+		columns->AddChild(col1);
+		columns->AddChild(col2);
+		columns->AddChild(col3);
+		columns->AddChild(col4);
+
+		BLayoutBuilder::Group<>(this, B_VERTICAL, 0)
+			.Add(columns)
+			.End();
+	}
+
+	// Builds the always-visible header (logo, CPU/FX Engine/Boost, Input
+	// Gain/Master Volume, Effects Order, Save/Load Preset) into
+	// headerParent, a view RakarrackWindow keeps outside the scrolled area
+	// so none of this scrolls away with the effect racks. Lives here (not
+	// in RakarrackWindow) purely so it can call this view's own private
+	// Bind()/MakeMessage() -- the resulting widgets are added to
+	// headerParent, not to this view, and that's fine: a BControl's
+	// message still resolves to Window() regardless of which view in the
+	// window's hierarchy it's actually a child of, so Dispatch() (called
+	// from RakarrackWindow::MessageReceived on every MSG_ACTION) still
+	// reaches them the same way it reaches every slider in the scrolled
+	// columns below.
+	void BuildHeader(BView* headerParent)
+	{
+		RKR* rkr = fRkr;
+
+		BStringView* logo = new BStringView("logo", "Haikurack");
+		fTheme.Add(logo, kRoleNone, kRoleTitle, kRoleBg);
+		BFont logoFont(be_bold_font);
+		logoFont.SetSize(28.0f);
+		logoFont.SetFace(B_ITALIC_FACE | B_BOLD_FACE);
+		logo->SetFont(&logoFont);
+		logo->SetExplicitAlignment(BAlignment(B_ALIGN_LEFT, B_ALIGN_MIDDLE));
+
+		fCpuDisplay = new BStringView("cpu", "CPU: 0.00%");
+		fTheme.Add(fCpuDisplay, kRoleNone, kRoleValue, kRoleBg);
+		// Fixed width so the header doesn't reflow (a visible bounce/jitter
+		// in everything to its right) every time the text changes length as
+		// the percentage itself changes -- e.g. "0.37%" vs. "12.34%" are
+		// different widths, and Pulse() updates this via SetText() many
+		// times a second.
+		fCpuDisplay->SetExplicitMinSize(BSize(80, B_SIZE_UNSET));
+		fCpuDisplay->SetExplicitMaxSize(BSize(80, B_SIZE_UNSET));
+
+		// "Hide Inactive Effects" + the live "Max Concurrent Effects
+		// Allowed: N of 10" readout, stacked directly under the CPU display
+		// -- see fEffectBoxes/RefreshEffectVisibility() and Pulse() below.
+		fHideInactive = new BCheckBox("hide_inactive", "Hide Inactive Effects",
+			MakeMessage(Bind([this](int32 v) {
+				fHideInactiveEffects = v != 0;
+				RefreshEffectVisibility();
+				// Collapsing down to just the active boxes can leave the
+				// scroll position (unchanged by any of the above) pointing
+				// at empty space below the now-much-shorter content -- e.g.
+				// an effect turned on near the bottom of the full list ends
+				// up the only (and so topmost) visible box once everything
+				// else is hidden, but the view stayed scrolled to where
+				// that box used to be. Scroll back to the top whenever this
+				// is turned on so a newly-collapsed rack is never blank.
+				// (fMainView == this -- see RakarrackWindow's constructor,
+				// which hands this same RakarrackView to BScrollView as the
+				// view it scrolls.)
+				if (fHideInactiveEffects)
+					ScrollTo(BPoint(0, 0));
+			})));
+		fTheme.Add(fHideInactive, kRoleBg);
+
+		fMaxEffectsLabel = new BStringView("max_effects",
+			"Max Concurrent Effects Allowed: 0 of 10");
+		fTheme.Add(fMaxEffectsLabel, kRoleNone, kRoleLabel, kRoleBg);
+		BFont maxEffectsFont(be_plain_font);
+		maxEffectsFont.SetSize(10.0f);
+		maxEffectsFont.SetFace(B_ITALIC_FACE);
+		fMaxEffectsLabel->SetFont(&maxEffectsFont);
+
+		// To the right of "Max Concurrent Effects Allowed": which preset is
+		// currently loaded, then the three factory Bank preset pickers and
+		// a Random Preset button -- rakarrack.cxx's own Bank window
+		// (Default/Extra/Extra1.rkrb, the "1"/"2"/"3" buttons there) and
+		// RKRGUI::RandomPreset(), reworked as plain dropdowns/a button
+		// instead of a whole separate browser window. See ApplyBankPreset()/
+		// ApplyRandomPreset() below for what selecting from these actually
+		// does.
+		fPresetNameLabel = new BStringView("preset_name", "Current Preset: ");
+		fTheme.Add(fPresetNameLabel, kRoleNone, kRoleLabel, kRoleBg);
+		fPresetNameLabel->SetFont(&maxEffectsFont);
+
+		// "|" separators, same font/color as fMaxEffectsLabel/
+		// fPresetNameLabel, so the whole row reads as one status line.
+		auto makeSeparator = [&]() -> BStringView* {
+			BStringView* sep = new BStringView("sep", "|");
+			fTheme.Add(sep, kRoleNone, kRoleLabel, kRoleBg);
+			sep->SetFont(&maxEffectsFont);
+			return sep;
+		};
+
+		// One Bank 1/2/3 dropdown, listing that bank's named presets --
+		// rkr->B_Names[bankIndex][1..60] is populated once at startup by
+		// RKR::loadnames() (process.C's shared constructor, so this is
+		// already filled in by the time BuildHeader runs regardless of
+		// mode), independently of whichever bank happens to be the live
+		// rkr->Bank[] at the moment -- so this doesn't need to load
+		// anything just to list names. Selecting an item sends
+		// MSG_BANK_PRESET directly (not through Bind()/MSG_ACTION -- see
+		// that message's own declaration comment) with which bank and
+		// which of its slots to actually load, handled by
+		// ApplyBankPreset().
+		auto buildBankMenu = [&](const char* label, int32 bankIndex) -> BMenuField* {
+			BPopUpMenu* menu = new BPopUpMenu(label);
+			for (int32 j = 1; j <= 60; j++) {
+				const char* name = rkr->B_Names[bankIndex][j].Preset_Name;
+				if (name[0] == '\0')
+					continue;
+				BMessage* itemMsg = new BMessage(MSG_BANK_PRESET);
+				itemMsg->AddInt32("bank", bankIndex);
+				itemMsg->AddInt32("index", j);
+				menu->AddItem(new BMenuItem(name, itemMsg));
+			}
+			fMenus.push_back(menu);
+			// No attached label (NULL) -- the dropdown's own placeholder
+			// text (the BPopUpMenu's own "label" above, e.g. "Bank 1")
+			// already says which bank this is; a separate BMenuField label
+			// just repeated that redundantly ("Bank 1 [Bank 1 v]") and
+			// widened this already-wide row for nothing.
+			BMenuField* field = new BMenuField(label, NULL, menu);
+			fTheme.Add(field, kRoleBg);
+			field->SetFont(&maxEffectsFont);
+			return field;
+		};
+
+		BButton* randomBtn = new BButton("random_preset", "Random",
+			new BMessage(MSG_RANDOM_PRESET));
+		fTheme.Add(randomBtn, kRoleBg);
+		randomBtn->SetFont(&maxEffectsFont);
+
+		BGroupView* maxEffectsRow = new BGroupView(B_HORIZONTAL, 6);
+		fTheme.Add(maxEffectsRow, kRoleBg);
+		maxEffectsRow->AddChild(fMaxEffectsLabel);
+		maxEffectsRow->AddChild(makeSeparator());
+		maxEffectsRow->AddChild(fPresetNameLabel);
+		maxEffectsRow->AddChild(makeSeparator());
+		maxEffectsRow->AddChild(buildBankMenu("Bank 1", 0));
+		maxEffectsRow->AddChild(makeSeparator());
+		maxEffectsRow->AddChild(buildBankMenu("Bank 2", 1));
+		maxEffectsRow->AddChild(makeSeparator());
+		maxEffectsRow->AddChild(buildBankMenu("Bank 3", 2));
+		maxEffectsRow->AddChild(makeSeparator());
+		maxEffectsRow->AddChild(randomBtn);
+		maxEffectsRow->GroupLayout()->AddItem(BSpaceLayoutItem::CreateGlue());
+
+		// Primes "Current Preset:" from whatever rkr->Preset_Name already
+		// is at startup (empty unless a bank/preset was already loaded
+		// before this UI existed -- e.g. a command-line preset file).
+		RefreshPresetName();
+
+		fMasterFX = new BCheckBox("master_fx", "FX Engine",
+			MakeMessage(Bind([rkr](int32 v) {
+				rkr->Bypass = v ? 1 : 0;
+				if (!v) {
+					// A different flavor of the flooding this session has
+					// chased through disk I/O (Convolotron/Reverbtron/
+					// Echotron) and Reverb's comb-filter realloc: no single
+					// slow operation here, just RKR::cleanup_efx()
+					// (process.C) unconditionally zeroing all 46 effects'
+					// buffers in one sweep -- including the sample-rate-
+					// scaled ones (Echo/MusicDelay/RBEcho/Arpie's ~2-second
+					// delay lines, Looper's own loop buffer, potentially
+					// much longer), whose combined cost is enough to starve
+					// several consecutive audio callbacks the same way, all
+					// under this same Dispatch()-held lock. Confirmed in
+					// practice: reported with Convolotron active, but
+					// cleanup_efx() cleans every effect regardless of
+					// whether it's the one currently on, so this was never
+					// really Convolotron-specific.
+					//
+					// Safe to run unlocked here specifically because Bypass
+					// is already 0 by this point: Alg() (process.C) skips
+					// its entire per-effect out() loop whenever Bypass is
+					// false, so nothing on the audio thread reads or writes
+					// any of these buffers while cleanup_efx() zeroes them
+					// -- except for a callback already in flight with a
+					// stale (pre-flip) read of Bypass, which could still
+					// read a buffer mid-zero; that's a torn read (an
+					// inaudible-to-one-sample-glitch risk, not a crash --
+					// nothing here reallocates a pointer the way Reverb's
+					// comb[] did), the same class of risk already accepted
+					// for Convolotron's own prefetchIR()/commitIR().
+					pthread_mutex_unlock(&jmutex);
+					rkr->cleanup_efx();
+					pthread_mutex_lock(&jmutex);
+				}
+			})));
+		fMasterFX->SetValue(rkr->Bypass ? B_CONTROL_ON : B_CONTROL_OFF);
+		fTheme.Add(fMasterFX, kRoleBg);
+		BFont boldFont(be_bold_font);
+		fMasterFX->SetFont(&boldFont);
+
+		BCheckBox* boost = new BCheckBox("boost", "Boost +10dB",
+			MakeMessage(Bind([rkr](int32 v) {
+				rkr->booster = v ? dB2rap(10.0f) : 1.0f;
+			})));
+		boost->SetValue(rkr->booster > 1.0f ? B_CONTROL_ON : B_CONTROL_OFF);
+		fTheme.Add(boost, kRoleBg);
+
+		BCheckBox* limiter6 = new BCheckBox("limiter6", "+6dB Limiter",
+			MakeMessage(Bind([rkr](int32 v) {
+				rkr->db6booster = v ? 1 : 0;
+			})));
+		limiter6->SetValue(rkr->db6booster ? B_CONTROL_ON : B_CONTROL_OFF);
+		fTheme.Add(limiter6, kRoleBg);
+
+		// Opens (or, if already built, just refreshes, un-hides and raises)
+		// the Effects Order window -- see OrderWindow above. This window is
+		// created once and then only ever hidden, never destroyed, for the
+		// life of the app (see OrderWindow::QuitRequested()).
+		//
+		// This button (and Save/Load Preset below) deliberately does NOT go
+		// through Bind()/MakeMessage() (MSG_ACTION) like every other control
+		// here -- RakarrackWindow wraps every MSG_ACTION dispatch in jmutex,
+		// and OpenOrderWindow()/the save-and-load panels are real,
+		// possibly-slow work (building a window, opening a BFilePanel) that
+		// has nothing to do with the engine state jmutex actually protects.
+		// See MSG_OPEN_ORDER's comment.
+		BButton* orderBtn = new BButton("order", "Effects Order...",
+			new BMessage(MSG_OPEN_ORDER));
+
+		BButton* savePresetBtn = new BButton("save_preset", "Save Preset",
+			new BMessage(MSG_SAVE_PRESET));
+		fTheme.Add(savePresetBtn, kRolePanel);
+
+		BButton* loadPresetBtn = new BButton("load_preset", "Load Preset",
+			new BMessage(MSG_LOAD_PRESET));
+		fTheme.Add(loadPresetBtn, kRolePanel);
+
+		// FX Engine/Boost/Effects Order/Save/Load Preset, left-aligned on
+		// their own row -- kept off of maxEffectsRow (already wide from
+		// three Bank dropdowns) and off of "Hide Inactive Effects"'s row
+		// (no glue pushing this one over, unlike the previous layout) so
+		// neither row's width drags the other's content around.
+		BGroupView* fxRow = new BGroupView(B_HORIZONTAL, 10);
+		fTheme.Add(fxRow, kRoleBg);
+		fxRow->AddChild(fMasterFX);
+		fxRow->AddChild(boost);
+		fxRow->AddChild(limiter6);
+		fxRow->AddChild(orderBtn);
+		fxRow->AddChild(savePresetBtn);
+		fxRow->AddChild(loadPresetBtn);
+		fxRow->GroupLayout()->AddItem(BSpaceLayoutItem::CreateGlue());
+
+		BGroupView* controls = new BGroupView(B_VERTICAL, 2);
+		controls->GroupLayout()->SetInsets(10, 0, 10, 4);
+		fTheme.Add(controls, kRoleBg);
+		controls->AddChild(fCpuDisplay);
+		controls->AddChild(fHideInactive);
+		controls->AddChild(maxEffectsRow);
+		controls->AddChild(fxRow);
+
+		// Third row: Input Gain/Master Volume (wrapped down from the controls
+		// row above so it has room to breathe) plus the waveform view, left
+		// to right. Half the usual 190px track width (see AddSlider's
+		// "width" parameter) -- full-width here made this row noticeably
+		// wider than it needed to be next to the compact scope/MIDI panel.
+		static const int32 kHeaderSliderWidth = 95;
+		BGroupView* volumeGroup = new BGroupView(B_HORIZONTAL, 10);
+		fTheme.Add(volumeGroup, kRoleBg);
+		AddSlider(volumeGroup, "in_gain", "Input Gain", -50, 50,
+			(int32)(rkr->Input_Gain * 100.0f) - 50,
+			[rkr](int32 v) {
+				rkr->Input_Gain = (float)((v + 50) / 100.0);
+				rkr->calculavol(1);
+			}, kHeaderSliderWidth);
+		AddSlider(volumeGroup, "out_gain", "Master Volume", -50, 50,
+			(int32)(rkr->Master_Volume * 100.0f) - 50,
+			[rkr](int32 v) {
+				rkr->Master_Volume = (float)((v + 50) / 100.0);
+				rkr->calculavol(2);
+			}, kHeaderSliderWidth);
+
+		// The sliders above only set their on-screen position from
+		// Input_Gain/Master_Volume -- they never fire their own callback, so
+		// without this, Log_I_Gain/Log_M_Volume (the actual gain multipliers
+		// used in the audio path, see process.C's calculavol()) stay
+		// uninitialized until the user manually touches a slider. Mirrors
+		// rakarrack.cxx's own startup priming (RKRGUI's constructor).
+		rkr->calculavol(1);
+		rkr->calculavol(2);
+		rkr->booster = 1.0f;
+
+		ScopeView* scope = new ScopeView(rkr);
+
+		// The MIDI (guitar-to-MIDI) converter panel -- a native port of
+		// rakarrack.cxx's "Midi" group (nidi_activar/MIDIOctave/
+		// Midi_out_Counter/Trig_Adj). Velocity (Vel_Adj there) is left out,
+		// per instructions -- it doesn't work. This effect sits outside the
+		// changepar()/getpar() rack chain entirely (no effect-type ID, never
+		// occupies an efx_order[] slot), so it's built directly here instead
+		// of through BuildEffectBox/BuildColumnN. Its own row, below Input
+		// Gain/Master Volume/the scope, rather than crowding them.
+		// Unlike the effect boxes (see BuildEffectBox/TitleCheckBox), the
+		// MIDI box keeps a plain title plus a separate "On" checkbox inside
+		// it: with its on/off switch in the label, a switched-off MIDI box
+		// in the header collapsed to a tall, narrow, empty frame instead of
+		// a compact box.
+		BBox* midiBox = new BBox("midi_box");
+		fTheme.Add(midiBox, kRolePanel);
+		BStringView* midiTitle = new BStringView("midi_title", "MIDI");
+		fTheme.Add(midiTitle, kRoleNone, kRoleTitle, kRolePanel);
+		BFont midiTitleFont(be_bold_font);
+		midiTitle->SetFont(&midiTitleFont);
+		midiBox->SetLabel(midiTitle);
+
+		BGroupView* midiContent = new BGroupView(B_VERTICAL, 6);
+		midiContent->GroupLayout()->SetInsets(8);
+		fTheme.Add(midiContent, kRolePanel);
+
+		// Everything below the "On" checkbox -- hidden whenever MIDI is off.
+		// Built before midiOn since its callback below needs to reach it.
+		BGroupView* midiBody = new BGroupView(B_VERTICAL, 4);
+		fTheme.Add(midiBody, kRolePanel);
+
+		BCheckBox* midiOn = new BCheckBox("midi_on", "On",
+			MakeMessage(Bind([rkr, midiBody](int32 v) {
+				// Mirrors cb_nidi_activar_i: silence any note the converter
+				// currently thinks is held before switching it off, so
+				// nothing gets stuck on.
+				if (!v)
+					rkr->efx_MIDIConverter->panic();
+				rkr->MIDIConverter_Bypass = v ? 1 : 0;
+				if (v)
+					midiBody->Show();
+				else
+					midiBody->Hide();
+			})));
+		midiOn->SetValue(rkr->MIDIConverter_Bypass ? B_CONTROL_ON : B_CONTROL_OFF);
+		fTheme.Add(midiOn, kRolePanel);
+		midiContent->AddChild(midiOn);
+		if (rkr->MIDIConverter_Bypass == 0)
+			midiBody->Hide();
+		midiContent->AddChild(midiBody);
+
+		// Like the Input Gain/Master Volume sliders above, AddSlider() only
+		// sets a slider's on-screen position from whatever field it's
+		// given as "initial" -- it never fires the slider's own callback,
+		// so anything that needs the *engine* to actually know that value
+		// (not just the widget to display it) has to be primed here,
+		// before any of the sliders below are built (several of them read
+		// these same fields for their own initial display).
+		//
+		// efx_MIDIConverter->channel/TrigVal happen to already be fine
+		// without this -- MIDIConverter's own constructor defaults
+		// (channel 0, TrigVal .25f) already match what's shown below --
+		// but VelVal (which MIDI_Send_Note_On() uses to compute the
+		// velocity byte sent to an external synth) has NO constructor
+		// default at all, so it was whatever garbage happened to be on
+		// the heap. rakarrack.cxx always primes this at startup too (see
+		// its "Velocity Adjust" pref, default 50) even though no Velocity
+		// slider is exposed here (per instructions -- it doesn't work).
+		// Without this, notes could reach an external synth (e.g.
+		// MidiSynth) and visibly trigger there -- schmittFloat()'s note
+		// detection doesn't depend on VelVal -- while playing at whatever
+		// garbage velocity resulted, typically silent once clamped to the
+		// 1-127 range.
+		rkr->efx_MIDIConverter->setmidichannel(rkr->efx_MIDIConverter->channel);
+		rkr->efx_MIDIConverter->setTriggerAdjust(
+			rkr->efx_MIDIConverter->TrigVal > 0.0f
+				? (int32)(1.0f / rkr->efx_MIDIConverter->TrigVal + 0.5f)
+				: 4);
+		rkr->efx_MIDIConverter->setVelAdjust(50);
+
+		// Same story again, this time for incoming MIDI ("Rakarrack IN" --
+		// see src/rkrMIDI.C's RKR::Conecta()/jack_process_midievents()):
+		// rkr->MidiCh and rkr->RControl are given real defaults by
+		// RKR::RKR() itself (src/process.C), shared by every frontend, so
+		// they're already fine here. rkr->HarCh (the channel the
+		// Harmonizer/StereoHarm "MIDI" toggle listens on for chord input
+		// via RecChord::MiraChord()) and rkr->MIDIway (which CC-mapping
+		// table process_midi_controller_events() uses) are NOT -- like
+		// VelVal above, rakarrack.cxx only ever sets them from its own
+		// "MIDI IN Harmonizer"/"MIDI Implementation" prefs at startup, so
+		// without this they'd be whatever garbage was on the heap here.
+		// Defaults match rakarrack.cxx's own fallbacks when no saved
+		// preference exists (channel 1, i.e. HarCh 0; MIDIway 0, the
+		// built-in CC map rather than the empty custom XUserMIDI table).
+		rkr->HarCh = 0;
+		rkr->MIDIway = 0;
+
+		// Octave defaults to -1 (per request) rather than MIDIConverter's
+		// own constructor default of 0 -- primed here, before the "Octave"
+		// dropdown below reads it, so both the dropdown's initial selection
+		// and the actual converted note octave start at -1 together.
+		rkr->efx_MIDIConverter->Moctave = -1;
+
+		// Wide gap between controls (vs. AddSlider's own tight 6px
+		// label/value/slider spacing within each one) so each slider
+		// clearly reads as trailing its own preceding label+value instead
+		// of blending into the next control's label -- with only 8px
+		// either side that trailing slider was easy to misread as
+		// belonging to whichever label came right after it instead.
+		BGroupView* midiRow1 = new BGroupView(B_HORIZONTAL, 24);
+		fTheme.Add(midiRow1, kRolePanel);
+		midiBody->AddChild(midiRow1);
+
+		// "Out Ch" -- named to distinguish it from "In Ch" below; this is
+		// the channel efx_MIDIConverter sends the guitar's converted
+		// notes out on (the "Rakarrack OUT" MIDI endpoint), not anything
+		// to do with incoming MIDI.
+		AddSlider(midiRow1, "midi_channel", "Out Ch", 1, 16,
+			rkr->efx_MIDIConverter->channel + 1,
+			[rkr](int32 v) { rkr->efx_MIDIConverter->setmidichannel(v - 1); },
+			kHeaderSliderWidth);
+
+		AddSlider(midiRow1, "midi_trigger", "Trigger", 2, 60,
+			rkr->efx_MIDIConverter->TrigVal > 0.0f
+				? (int32)(1.0f / rkr->efx_MIDIConverter->TrigVal + 0.5f)
+				: 4,
+			[rkr](int32 v) { rkr->efx_MIDIConverter->setTriggerAdjust(v); },
+			kHeaderSliderWidth);
+
+		AddTypeMenu(midiRow1, "midi_octave", "Octave", kMIDIOctaveNames,
+			rkr->efx_MIDIConverter->Moctave + 2,
+			[rkr](int32 v) { rkr->efx_MIDIConverter->Moctave = v - 2; });
+
+		// Rows 2 and 3 below (the guitar-to-MIDI fine-tune knobs and the
+		// incoming-MIDI channel/CC-map settings) are the ones you set once
+		// and rarely touch again, unlike Out Ch/Trigger/Octave above --
+		// tucked behind this "Advanced" checkbox, off by default, so the
+		// MIDI box's everyday footprint stays small. Same collapse
+		// mechanism as the "On" checkbox above (and every effect box's own
+		// "On" toggle): the checkbox itself always stays visible, only
+		// advancedBody's Show()/Hide() toggles.
+		BGroupView* advancedBody = new BGroupView(B_VERTICAL, 6);
+		fTheme.Add(advancedBody, kRolePanel);
+
+		BCheckBox* midiAdvanced = new BCheckBox("midi_advanced", "Advanced",
+			MakeMessage(Bind([advancedBody](int32 v) {
+				if (v)
+					advancedBody->Show();
+				else
+					advancedBody->Hide();
+			})));
+		fTheme.Add(midiAdvanced, kRolePanel);
+		midiBody->AddChild(midiAdvanced);
+		advancedBody->Hide();
+		midiBody->AddChild(advancedBody);
+
+		// Second row: the guitar-to-MIDI pitch tracker's own fine-tune
+		// knobs (Conv_Trig_Counter/Conv_Stable_Counter/Conv_Off_Counter/
+		// Conv_Freq_Ceiling_Counter/Conv_Freq_Floor_Counter in
+		// rakarrack.cxx). Unlike Out Ch/Trigger/Octave above, these five
+		// don't need explicit startup priming -- p_trigfact/
+		// p_stable_threshold/p_off_count_max/p_freq_ceiling/p_freq_floor
+		// all already have constructor defaults in MIDIConverter.C that
+		// match rakarrack.cxx's own widget defaults exactly (0.5, 2, 5,
+		// 320, 20).
+		//
+		// Trigger Sensitivity is the one float among these with a
+		// fractional step (0.1-1.0 by 0.05) -- shown as a plain integer
+		// slider like everything else here (10-100) rather than adding a
+		// decimal-display slider variant just for this one control, with
+		// the /100 conversion happening in the callback.
+		BGroupView* midiRow2 = new BGroupView(B_HORIZONTAL, 24);
+		fTheme.Add(midiRow2, kRolePanel);
+		advancedBody->AddChild(midiRow2);
+
+		AddSlider(midiRow2, "midi_trigsens", "Trig Sens", 10, 100,
+			(int32)(rkr->efx_MIDIConverter->p_trigfact * 100.0f + 0.5f),
+			[rkr](int32 v) { rkr->efx_MIDIConverter->p_trigfact = (float)v / 100.0f; },
+			kHeaderSliderWidth);
+
+		AddSlider(midiRow2, "midi_stability", "Stability", 1, 10,
+			rkr->efx_MIDIConverter->p_stable_threshold,
+			[rkr](int32 v) { rkr->efx_MIDIConverter->p_stable_threshold = v; },
+			kHeaderSliderWidth);
+
+		AddSlider(midiRow2, "midi_offgrace", "Off Grace", 1, 30,
+			rkr->efx_MIDIConverter->p_off_count_max,
+			[rkr](int32 v) { rkr->efx_MIDIConverter->p_off_count_max = v; },
+			kHeaderSliderWidth);
+
+		AddSlider(midiRow2, "midi_freqceil", "Freq Ceil", 50, 5000,
+			(int32)rkr->efx_MIDIConverter->p_freq_ceiling,
+			[rkr](int32 v) { rkr->efx_MIDIConverter->p_freq_ceiling = (float)v; },
+			kHeaderSliderWidth);
+
+		AddSlider(midiRow2, "midi_freqfloor", "Freq Floor", 20, 300,
+			(int32)rkr->efx_MIDIConverter->p_freq_floor,
+			[rkr](int32 v) { rkr->efx_MIDIConverter->p_freq_floor = (float)v; },
+			kHeaderSliderWidth);
+
+		// Third row: incoming MIDI ("Rakarrack IN") settings -- a native
+		// port of rakarrack.cxx's Midi_In_Counter/Har_In_Counter/Mw0+Mw1
+		// (Fl_Preferences "MIDI IN Channel"/"MIDI IN Harmonizer"/"MIDI
+		// Implementation"). "In Ch" gates Program Change (preset
+		// switching) and Control Change (parameter control, see
+		// RKR::process_midi_controller_events() in src/rkrMIDI.C); "Har
+		// Ch" is the separate channel the Harmonizer/StereoHarm "MIDI"
+		// toggle listens on for chord input (RecChord::MiraChord()); "CC
+		// Map" (labels match Mw0/Mw1 exactly) picks which table Control
+		// Change messages are looked up in. "MIDI Learn" isn't much use
+		// without a way to fill in XUserMIDI's per-CC assignments --
+		// rakarrack.cxx's own MIDI-learn UI for that ("ML_Menu") isn't
+		// ported here -- so it's included for parity/no-surprises rather
+		// than because it's fully usable yet; "Default" (the default
+		// either way) is the built-in CC map real rakarrack ships with,
+		// and needs no extra setup.
+		BGroupView* midiRow3 = new BGroupView(B_HORIZONTAL, 24);
+		fTheme.Add(midiRow3, kRolePanel);
+		advancedBody->AddChild(midiRow3);
+
+		AddSlider(midiRow3, "midi_in_ch", "In Ch", 1, 16,
+			rkr->MidiCh + 1,
+			[rkr](int32 v) { rkr->MidiCh = v - 1; },
+			kHeaderSliderWidth);
+
+		AddSlider(midiRow3, "midi_har_ch", "Har Ch", 1, 16,
+			rkr->HarCh + 1,
+			[rkr](int32 v) { rkr->HarCh = v - 1; },
+			kHeaderSliderWidth);
+
+		AddTypeMenu(midiRow3, "midi_ccmap", "CC Map", kCCMapNames,
+			rkr->MIDIway,
+			[rkr](int32 v) { rkr->MIDIway = v; });
+
+		midiBox->AddChild(midiContent);
+
+		// Row 3: Input Gain/Master Volume next to the scope.
+		BGroupView* meterRow = new BGroupView(B_HORIZONTAL, 10);
+		meterRow->GroupLayout()->SetInsets(10, 0, 10, 6);
+		fTheme.Add(meterRow, kRoleBg);
+		meterRow->AddChild(volumeGroup);
+		meterRow->AddChild(scope);
+		meterRow->GroupLayout()->AddItem(BSpaceLayoutItem::CreateGlue());
+
+		// Row 4: the MIDI panel, wrapped below row 3 instead of crowding it
+		// on one line.
+		// The Tap Tempo panel (rakarrack.cxx's "Tap" group): sets the tempo
+		// of every tempo-aware effect from a tap, incoming MIDI notes/clock,
+		// or -- new in 0.6.2 -- the Beat Tracker, which listens to the input
+		// signal. Like the MIDI box it sits outside the effect chain.
+		BBox* tapBox = new BBox("tap_box");
+		fTheme.Add(tapBox, kRolePanel);
+		BStringView* tapTitle = new BStringView("tap_title", "Tap Tempo");
+		fTheme.Add(tapTitle, kRoleNone, kRoleTitle, kRolePanel);
+		BFont tapTitleFont(be_bold_font);
+		tapTitle->SetFont(&tapTitleFont);
+		tapBox->SetLabel(tapTitle);
+
+		BGroupView* tapContent = new BGroupView(B_VERTICAL, 6);
+		tapContent->GroupLayout()->SetInsets(8);
+		fTheme.Add(tapContent, kRolePanel);
+
+		fTapBody = new BGroupView(B_VERTICAL, 4);
+		fTheme.Add(fTapBody, kRolePanel);
+
+		fTapOn = new BCheckBox("tap_on", "On",
+			MakeMessage(Bind([rkr](int32 v) {
+				rkr->Tap_Bypass = v ? 1 : 0;
+				if (v)
+					rkr->TapTempo_Timeout(0);
+			})));
+		fTapOn->SetValue(rkr->Tap_Bypass ? B_CONTROL_ON : B_CONTROL_OFF);
+		fTheme.Add(fTapOn, kRolePanel);
+		tapContent->AddChild(fTapOn);
+		if (rkr->Tap_Bypass == 0)
+			fTapBody->Hide();
+		tapContent->AddChild(fTapBody);
+
+		BGroupView* tapRow1 = new BGroupView(B_HORIZONTAL, 24);
+		fTheme.Add(tapRow1, kRolePanel);
+		fTapBody->AddChild(tapRow1);
+
+		int32 tapSourceIndex = 0;
+		for (int32 i = 0; i < 4; i++) {
+			if (kTapSourceValues[i] == rkr->Tap_Selection)
+				tapSourceIndex = i;
+		}
+		rkr->Tap_Selection = kTapSourceValues[tapSourceIndex];
+		AddTypeMenu(tapRow1, "tap_source", "Input", kTapSourceNames,
+			tapSourceIndex,
+			[rkr](int32 v) { rkr->Tap_Selection = kTapSourceValues[v]; });
+		AddTypeMenu(tapRow1, "tap_set", "Set", kTapSetNames, rkr->Tap_SetValue,
+			[this, rkr](int32 v) {
+				rkr->Tap_SetValue = v;
+				if (rkr->Tap_Bypass && rkr->Tap_TempoSet > 0) {
+					rkr->Update_tempo();
+					fTapNeedsRefresh = true;
+				}
+			});
+
+		BGroupView* tapRow2 = new BGroupView(B_HORIZONTAL, 24);
+		fTheme.Add(tapRow2, kRolePanel);
+		fTapBody->AddChild(tapRow2);
+
+		AddButton(tapRow2, "tap_button", "Tap", 1, [this, rkr](int32) {
+			if (rkr->Tap_Bypass && rkr->Tap_Selection == 0) {
+				rkr->TapTempo();
+				fTapNeedsRefresh = true;
+				fTapTempoDirty = true;
+			}
+		});
+		static const int32 kTapMin = 20, kTapMax = 360;
+		auto clampTempo = [rkr]() {
+			int32 t = rkr->Tap_TempoSet;
+			return t < kTapMin ? kTapMin : (t > kTapMax ? kTapMax : t);
+		};
+		AddSlider(tapRow2, "tap_tempo", "Tempo", kTapMin, kTapMax, clampTempo(),
+			[this, rkr](int32 v) {
+				if (rkr->Tap_Bypass) {
+					rkr->Tap_TempoSet = v;
+					rkr->Update_tempo();
+					fTapNeedsRefresh = true;
+				}
+			},
+			kHeaderSliderWidth, clampTempo, &fTapRefreshers);
+
+		tapBox->AddChild(tapContent);
+
+		BGroupView* midiRow = new BGroupView(B_HORIZONTAL, 10);
+		midiRow->GroupLayout()->SetInsets(10, 0, 10, 10);
+		fTheme.Add(midiRow, kRoleBg);
+		midiRow->AddChild(midiBox);
+		midiRow->AddChild(tapBox);
+		midiRow->GroupLayout()->AddItem(BSpaceLayoutItem::CreateGlue());
+
+		BGroupView* logoRow = new BGroupView(B_HORIZONTAL, 10);
+		logoRow->GroupLayout()->SetInsets(10, 10, 10, 4);
+		fTheme.Add(logoRow, kRoleBg);
+		logoRow->AddChild(logo);
+		logoRow->GroupLayout()->AddItem(BSpaceLayoutItem::CreateGlue());
+
+		BLayoutBuilder::Group<>(headerParent, B_VERTICAL, 0)
+			.Add(logoRow)
+			.Add(controls)
+			.Add(meterRow)
+			.Add(midiRow)
+			.End();
+	}
+
+	virtual void AttachedToWindow()
+	{
+		BView::AttachedToWindow();
+		for (BMenu* menu : fMenus)
+			menu->SetTargetForItems(Window());
+	}
+
+	// RakarrackWindow's scroll bars are hidden (see start_haiku_native_
+	// interface()) so the rack reads as one continuous dark surface
+	// instead of being framed by chrome -- this is the only remaining way
+	// to move around when the content is taller/wider than the window.
+	// A B_MOUSE_WHEEL_CHANGED with no scroll bar to handle it bubbles up
+	// from whichever child view the mouse is over (sliders, checkboxes,
+	// menus, the column groups, the effect boxes -- none of those have
+	// scroll bars either) until something consumes it; this view wraps
+	// all of that, so it is always eventually reached. Plain wheel moves
+	// vertically; the common desktop convention (Shift+wheel, which many
+	// mice/trackpads also report directly as a horizontal delta) moves
+	// horizontally.
+	virtual void MessageReceived(BMessage* msg)
+	{
+		if (msg->what == B_MOUSE_WHEEL_CHANGED) {
+			float dx = 0.0f, dy = 0.0f;
+			msg->FindFloat("be:wheel_delta_x", &dx);
+			msg->FindFloat("be:wheel_delta_y", &dy);
+			const float kStep = 32.0f;
+			ScrollClamped(dx * kStep, dy * kStep);
+			return;
+		}
+		BView::MessageReceived(msg);
+	}
+
+	// ScrollBy() alone has no idea where the content ends -- with no scroll
+	// bars there's no range limiting it -- so the wheel could scroll the
+	// racks arbitrarily far out of view. Clamp to the content's extent
+	// instead: the farther of this view's own edge and its only child's
+	// (the "columns" group from the constructor -- Frame() is in this
+	// view's unscrolled coordinates), minus the visible area, which is the
+	// enclosing BScrollView's size if this view is bigger than it. Also
+	// pulls the position back in if the content has shrunk since (e.g.
+	// "Hide Inactive Effects").
+	void ScrollClamped(float dx, float dy)
+	{
+		BRect bounds = Bounds();
+		float extentRight = bounds.Width();
+		float extentBottom = bounds.Height();
+		if (BView* content = ChildAt(0)) {
+			BRect contentFrame = content->Frame();
+			if (contentFrame.right > extentRight)
+				extentRight = contentFrame.right;
+			if (contentFrame.bottom > extentBottom)
+				extentBottom = contentFrame.bottom;
+		}
+		float visibleW = bounds.Width();
+		float visibleH = bounds.Height();
+		if (BView* parent = Parent()) {
+			BRect parentBounds = parent->Bounds();
+			if (parentBounds.Width() < visibleW)
+				visibleW = parentBounds.Width();
+			if (parentBounds.Height() < visibleH)
+				visibleH = parentBounds.Height();
+		}
+		float maxX = extentRight - visibleW;
+		float maxY = extentBottom - visibleH;
+		float x = bounds.left + dx;
+		float y = bounds.top + dy;
+		if (x > maxX)
+			x = maxX;
+		if (y > maxY)
+			y = maxY;
+		if (x < 0.0f)
+			x = 0.0f;
+		if (y < 0.0f)
+			y = 0.0f;
+		if (x != bounds.left || y != bounds.top)
+			ScrollTo(BPoint(x, y));
+	}
+
+	virtual void Pulse()
+	{
+		if (!fRkr)
+			return;
+		char cpuBuf[32];
+		sprintf(cpuBuf, "CPU: %5.2f%%", (float)fRkr->cpuload);
+		fCpuDisplay->SetText(cpuBuf);
+
+		// Live count of effects currently occupying one of the engine's 10
+		// efx_order[] slots (see fEffectBoxes' own comment) -- any box's
+		// "On" toggle can change this at any time, so this, like the CPU
+		// readout above, is refreshed every Pulse() rather than only when
+		// a box is built.
+		int activeCount = 0;
+		for (EffectBoxEntry& e : fEffectBoxes) {
+			if (*e.bypass != 0)
+				activeCount++;
+		}
+		char maxEffectsBuf[64];
+		snprintf(maxEffectsBuf, sizeof(maxEffectsBuf),
+			"Max Concurrent Effects Allowed: %d of 10", activeCount);
+		fMaxEffectsLabel->SetText(maxEffectsBuf);
+		RefreshEffectVisibility();
+
+		// Tap Tempo: follow engine-side changes (the Beat Tracker or MIDI
+		// clock updating the tempo, a MIDI CC switching the panel on/off, the
+		// idle timeout switching it off) and re-read every effect box once
+		// the tempo has been pushed into them.
+		if (fTapOn != NULL) {
+			pthread_mutex_lock(&jmutex);
+			if (fRkr->Tap_Display == 2) {
+				fRkr->Tap_Display = 0;
+				fRkr->Tap_Bypass = 0;
+			}
+			bool tapOn = fRkr->Tap_Bypass != 0;
+			if (tapOn && fRkr->Tap_Display == 1) {
+				fRkr->Tap_Display = 0;
+				fTapNeedsRefresh = true;
+				fTapTempoDirty = true;
+			}
+			pthread_mutex_unlock(&jmutex);
+			if ((fTapOn->Value() == B_CONTROL_ON) != tapOn)
+				fTapOn->SetValue(tapOn ? B_CONTROL_ON : B_CONTROL_OFF);
+			SetViewVisible(fTapBody, tapOn);
+			if (fTapTempoDirty) {
+				fTapTempoDirty = false;
+				for (auto& r : fTapRefreshers)
+					r();
+			}
+			if (fTapNeedsRefresh) {
+				fTapNeedsRefresh = false;
+				RefreshEffectBoxes(kPresetRefreshEffectIds);
+			}
+		}
+
+		// Apply any AddDebouncedSlider() value that's settled -- no further
+		// drag movement for kDebounceUsec -- since the last check. Locked
+		// like every other real engine mutation: the real-time audio
+		// callback needs this same lock, which is exactly why these calls
+		// are being held back from firing on every drag step in the first
+		// place.
+		static const bigtime_t kDebounceUsec = 150000; // 150ms
+		bigtime_t now = system_time();
+		for (DebouncedSlider& d : fDebounced) {
+			if (d.hasPending && (now - d.lastChangeTime) >= kDebounceUsec) {
+				d.hasPending = false;
+				pthread_mutex_lock(&jmutex);
+				d.apply(d.pendingValue);
+				pthread_mutex_unlock(&jmutex);
+			}
+		}
+	}
+
+	// Called by RakarrackWindow::MessageReceived (already holding jmutex)
+	// for every MSG_ACTION.
+	void Dispatch(BMessage* msg)
+	{
+		int32 aidx;
+		if (msg->FindInt32("aidx", &aidx) != B_OK)
+			return;
+		if (aidx < 0 || (size_t)aidx >= fActions.size())
+			return;
+
+		int32 value;
+		if (msg->FindInt32("val", &value) != B_OK)
+			value = msg->GetInt32("be:value", 0);
+
+		fActions[aidx](value);
+	}
+
+	ThemeRegistry& Themes() { return fTheme; }
+
+	// Recolors the whole main window from gTheme (already updated by the
+	// caller -- see RakarrackWindow's B_COLORS_UPDATED handling), then
+	// tells the Effects Order window, if it's been built yet, to do the
+	// same on its own thread.
+	void ApplyTheme()
+	{
+		fTheme.Apply();
+		Invalidate();
+		if (fOrderWindow != nullptr)
+			BMessenger(fOrderWindow).SendMessage(MSG_THEME_CHANGED);
+	}
+
+	// Called by RakarrackWindow::MessageReceived for MSG_OPEN_ORDER --
+	// deliberately NOT under jmutex (see that message's declaration for
+	// why). Opens the Effects Order window, building it the first time and
+	// just refreshing/un-hiding/raising it after that.
+	void OpenOrderWindow()
+	{
+		if (fOrderWindow == nullptr) {
+			// A just-constructed BWindow is locked to the constructing
+			// thread until its first Unlock() (which Show() takes care of)
+			// -- safe without an explicit Lock() here.
+			fOrderWindow = new OrderWindow(fRkr);
+			fOrderWindow->Show();
+			return;
+		}
+		// Once shown, a BWindow runs its own message loop on its own
+		// thread -- reaching into it from here (a different thread) needs
+		// its lock held first, unlike the just-constructed case above.
+		if (fOrderWindow->Lock()) {
+			fOrderWindow->Refresh();
+			if (fOrderWindow->IsHidden())
+				fOrderWindow->Show();
+			fOrderWindow->Activate();
+			fOrderWindow->Unlock();
+		}
+	}
+
+private:
+	// Registers a callback and returns its slot; used by every control.
+	int32 Bind(std::function<void(int32)> fn)
+	{
+		fActions.push_back(fn);
+		return (int32)(fActions.size() - 1);
+	}
+
+	BMessage* MakeMessage(int32 actionIndex, int32 explicitValue = -0x7fffffff)
+	{
+		BMessage* msg = new BMessage(MSG_ACTION);
+		msg->AddInt32("aidx", actionIndex);
+		if (explicitValue != -0x7fffffff)
+			msg->AddInt32("val", explicitValue);
+		return msg;
+	}
+
+	// label ... value ... bar, one row, mirroring rakarrack.cxx's SliderW
+	// (which draws its own live numeric readout next to the track --
+	// BSlider has no such thing built in, so this adds a plain BStringView
+	// next to it and keeps it in sync on every value change). Label/value
+	// widths are fixed so sliders line up across a whole effect box.
+	BSlider* AddSlider(BView* parent, const char* name, const char* label,
+		int32 min, int32 max, int32 initial, std::function<void(int32)> fn,
+		// Every effect box slider relies on the 190px default; only the
+		// header's Input Gain/Master Volume/MIDI Channel/MIDI Trigger pass
+		// something narrower (see BuildHeader) to keep that row compact.
+		int32 width = 190,
+		// See BuildEffectBox's "refreshers" comment -- both null for every
+		// call site outside BuildEffectBox itself (Input Gain/Master
+		// Volume/MIDI), which have no per-effect refresh list to join.
+		std::function<int32()> refreshValue = nullptr,
+		std::vector<std::function<void()>>* refreshers = nullptr)
+	{
+		BGroupView* row = new BGroupView(B_HORIZONTAL, 6);
+		fTheme.Add(row, kRolePanel);
+
+		BStringView* labelView = new BStringView("lbl", label);
+		fTheme.Add(labelView, kRoleNone, kRoleLabel, kRolePanel);
+		labelView->SetExplicitMinSize(BSize(72, B_SIZE_UNSET));
+		labelView->SetExplicitMaxSize(BSize(72, B_SIZE_UNSET));
+		labelView->SetFontSize(10.5f);
+
+		BStringView* valueView = new BStringView("val", "");
+		fTheme.Add(valueView, kRoleNone, kRoleValue, kRolePanel);
+		valueView->SetExplicitMinSize(BSize(32, B_SIZE_UNSET));
+		valueView->SetExplicitMaxSize(BSize(32, B_SIZE_UNSET));
+		valueView->SetExplicitAlignment(
+			BAlignment(B_ALIGN_RIGHT, B_ALIGN_VERTICAL_CENTER));
+		valueView->SetFontSize(10.5f);
+		char buf[16];
+		snprintf(buf, sizeof(buf), "%d", (int)initial);
+		valueView->SetText(buf);
+
+		int32 idx = Bind([fn, valueView](int32 v) {
+			char buf[16];
+			snprintf(buf, sizeof(buf), "%d", (int)v);
+			valueView->SetText(buf);
+			fn(v);
+		});
+
+		WheelSlider* s = new WheelSlider(name, MakeMessage(idx), min, max,
+			B_HORIZONTAL);
+		s->SetValue(initial);
+		s->SetHashMarks(B_HASH_MARKS_NONE);
+		fTheme.AddSlider(s, kRolePanel, kRoleAccent);
+		// Roughly doubles the effect boxes' width over the default track
+		// size -- cramped sliders were hard to drag precisely.
+		s->SetExplicitMinSize(BSize(width, B_SIZE_UNSET));
+
+		row->AddChild(labelView);
+		row->AddChild(valueView);
+		row->AddChild(s);
+		parent->AddChild(row);
+
+		if (refreshers && refreshValue) {
+			refreshers->push_back([s, valueView, refreshValue]() {
+				int32 v = refreshValue();
+				s->SetValue(v);
+				char buf[16];
+				snprintf(buf, sizeof(buf), "%d", (int)v);
+				valueView->SetText(buf);
+			});
+		}
+
+		return s;
+	}
+
+	// Same look and feel as AddSlider, but the actual fn(v) call -- the
+	// real changepar(), which for a handful of parameters (see ParamDef's
+	// "debounced" comment) does real, possibly-slow DSP work -- is held
+	// until ~150ms after the value stops changing, applied from Pulse()
+	// below, rather than firing on every single drag step.
+	BSlider* AddDebouncedSlider(BView* parent, const char* name,
+		const char* label, int32 min, int32 max, int32 initial,
+		std::function<void(int32)> fn,
+		std::function<int32()> refreshValue = nullptr,
+		std::vector<std::function<void()>>* refreshers = nullptr)
+	{
+		BGroupView* row = new BGroupView(B_HORIZONTAL, 6);
+		fTheme.Add(row, kRolePanel);
+
+		BStringView* labelView = new BStringView("lbl", label);
+		fTheme.Add(labelView, kRoleNone, kRoleLabel, kRolePanel);
+		labelView->SetExplicitMinSize(BSize(72, B_SIZE_UNSET));
+		labelView->SetExplicitMaxSize(BSize(72, B_SIZE_UNSET));
+		labelView->SetFontSize(10.5f);
+
+		BStringView* valueView = new BStringView("val", "");
+		fTheme.Add(valueView, kRoleNone, kRoleValue, kRolePanel);
+		valueView->SetExplicitMinSize(BSize(32, B_SIZE_UNSET));
+		valueView->SetExplicitMaxSize(BSize(32, B_SIZE_UNSET));
+		valueView->SetExplicitAlignment(
+			BAlignment(B_ALIGN_RIGHT, B_ALIGN_VERTICAL_CENTER));
+		valueView->SetFontSize(10.5f);
+		char buf[16];
+		snprintf(buf, sizeof(buf), "%d", (int)initial);
+		valueView->SetText(buf);
+
+		// fDebounced is a deque specifically because it never invalidates
+		// references to existing elements when it grows (unlike a vector,
+		// which can reallocate) -- entry's address has to stay valid for
+		// the lifetime of the lambda below, which outlives this call.
+		fDebounced.emplace_back();
+		DebouncedSlider* entry = &fDebounced.back();
+		entry->apply = fn;
+
+		int32 idx = Bind([entry, valueView](int32 v) {
+			char buf[16];
+			snprintf(buf, sizeof(buf), "%d", (int)v);
+			valueView->SetText(buf);
+			entry->hasPending = true;
+			entry->pendingValue = v;
+			entry->lastChangeTime = system_time();
+		});
+
+		WheelSlider* s = new WheelSlider(name, MakeMessage(idx), min, max,
+			B_HORIZONTAL);
+		s->SetValue(initial);
+		s->SetHashMarks(B_HASH_MARKS_NONE);
+		fTheme.AddSlider(s, kRolePanel, kRoleAccent);
+		s->SetExplicitMinSize(BSize(190, B_SIZE_UNSET));
+
+		row->AddChild(labelView);
+		row->AddChild(valueView);
+		row->AddChild(s);
+		parent->AddChild(row);
+
+		if (refreshers && refreshValue) {
+			// A refresh is a programmatic snap-to-the-loaded-value, not a
+			// drag -- goes straight to the slider/label, bypassing the
+			// pending-entry/Pulse() debounce machinery above entirely
+			// (nothing to coalesce; there's exactly one value to show).
+			refreshers->push_back([s, valueView, refreshValue]() {
+				int32 v = refreshValue();
+				s->SetValue(v);
+				char buf[16];
+				snprintf(buf, sizeof(buf), "%d", (int)v);
+				valueView->SetText(buf);
+			});
+		}
+
+		return s;
+	}
+
+	BCheckBox* AddToggle(BView* parent, const char* name, const char* label,
+		bool initial, std::function<void(int32)> fn,
+		std::function<int32()> refreshValue = nullptr,
+		std::vector<std::function<void()>>* refreshers = nullptr)
+	{
+		int32 idx = Bind(fn);
+		BCheckBox* c = new BCheckBox(name, label, MakeMessage(idx));
+		c->SetValue(initial ? B_CONTROL_ON : B_CONTROL_OFF);
+		fTheme.Add(c, kRolePanel);
+		parent->AddChild(c);
+
+		if (refreshers && refreshValue) {
+			refreshers->push_back([c, refreshValue]() {
+				c->SetValue(refreshValue() != 0 ? B_CONTROL_ON : B_CONTROL_OFF);
+			});
+		}
+
+		return c;
+	}
+
+	// A momentary press that sends a fixed value -- Looper's transport
+	// controls (Play/Stop/Record/...) are plain Fl_Button presses in
+	// rakarrack.cxx, each just a changepar(npar, 1) call, not a toggle with
+	// its own on/off state.
+	BButton* AddButton(BView* parent, const char* name, const char* label,
+		int32 pressValue, std::function<void(int32)> fn)
+	{
+		int32 idx = Bind(fn);
+		BButton* b = new BButton(name, label, MakeMessage(idx, pressValue));
+		fTheme.Add(b, kRolePanel);
+		parent->AddChild(b);
+		return b;
+	}
+
+	BMenuField* AddTypeMenu(BView* parent, const char* name, const char* label,
+		const std::vector<std::string>& items, int32 initial,
+		std::function<void(int32)> fn,
+		std::function<int32()> refreshValue = nullptr,
+		std::vector<std::function<void()>>* refreshers = nullptr)
+	{
+		int32 idx = Bind(fn);
+		BPopUpMenu* menu = new BPopUpMenu(label);
+		for (size_t i = 0; i < items.size(); i++) {
+			BMenuItem* item = new BMenuItem(items[i].c_str(),
+				MakeMessage(idx, (int32)i));
+			menu->AddItem(item);
+			if ((int32)i == initial)
+				item->SetMarked(true);
+		}
+		fMenus.push_back(menu);
+		BMenuField* field = new BMenuField(name, label, menu);
+		fTheme.Add(field, kRolePanel);
+		parent->AddChild(field);
+
+		if (refreshers && refreshValue) {
+			refreshers->push_back([menu, refreshValue]() {
+				BMenuItem* item = menu->ItemAt(refreshValue());
+				if (item)
+					item->SetMarked(true);
+			});
+		}
+
+		return field;
+	}
+
+	// One "rack box" -- title, on/off, an optional type menu, optional plain
+	// toggles, then every parameter slider. changeFn/getFn wrap whichever
+	// method the effect actually exposes (changepar, Compressor_Change,
+	// Gate_Change...) so the rest of this stays effect-agnostic.
+	void BuildEffectBox(BView* column, const char* title, RKR* rkr,
+		int effectId, int* bypass,
+		std::function<void(int32, int32)> changeFn,
+		std::function<int32(int32)> getFn,
+		const std::vector<ParamDef>& params,
+		const std::vector<ToggleDef>& toggles = std::vector<ToggleDef>(),
+		const std::vector<TypeMenuDef>& typeMenus = std::vector<TypeMenuDef>(),
+		// Escape hatch for controls that don't fit the slider/toggle/dropdown
+		// model -- Looper's transport buttons are the only user of this so
+		// far. Called with the effect's body BGroupView after every param
+		// above has already been added to it.
+		std::function<void(BView*)> extraWidgets = nullptr,
+		// Added at the very end, after every other optional parameter, so
+		// every existing call site above (with whatever mix of toggles/
+		// typeMenus/extraWidgets it already passes) keeps compiling
+		// unchanged -- see PresetMenuDef.
+		const PresetMenuDef& preset = PresetMenuDef(),
+		// Non-null makes this effect permanently off: the "On" checkbox is
+		// disabled (can't be clicked) and carries this string as its
+		// tooltip, and -- the part that actually matters, since a Load
+		// Preset/Bank preset/Random Preset sets *bypass directly, never
+		// through that checkbox -- fEffectRefreshers below forces *bypass
+		// back to 0 every time it runs, regardless of what a preset just
+		// set it to. Currently only Reverb passes this (see BuildColumn3),
+		// for the sample-rate instability described in its own comment
+		// there.
+		const char* disabledReason = nullptr)
+	{
+		BBox* box = new BBox(title);
+		fTheme.Add(box, kRolePanel);
+
+		// The box's only child. Deliberately zero insets -- the padding lives
+		// on body instead -- so that with body hidden this collapses to
+		// nothing and an inactive effect is just its label row.
+		BGroupView* content = new BGroupView(B_VERTICAL, 0);
+		fTheme.Add(content, kRolePanel);
+
+		// Every control of the effect -- hidden whenever the effect is off,
+		// so an inactive effect collapses to just its title bar instead of
+		// eating vertical space in the rack.
+		BGroupView* body = new BGroupView(B_VERTICAL, 4);
+		body->GroupLayout()->SetInsets(8);
+		fTheme.Add(body, kRolePanel);
+
+		// A permanently-disabled effect (see disabledReason's own comment)
+		// never gets to claim a slot at all -- force it off before even
+		// the ActivateEffectSlot() priming below runs, covering a bank/
+		// preset already loaded (e.g. via -p) before this UI existed.
+		if (disabledReason)
+			*bypass = 0;
+
+		// If a loaded bank/preset already has this effect's Bypass flag on
+		// by the time this box is built, claim its chain slot right away so
+		// the checkbox's initial "on" state matches what's actually
+		// audible. If the chain is somehow already full at startup, fall
+		// back to showing it off rather than lying in the UI.
+		if (*bypass != 0 && !ActivateEffectSlot(rkr, effectId))
+			*bypass = 0;
+
+		// The effect's on/off switch doubles as the box's label (title) --
+		// see TitleCheckBox. Built directly (not through AddToggle) because
+		// the callback below needs to reach back into the checkbox itself
+		// to revert it when ActivateEffectSlot() fails -- AddToggle hands
+		// back its BCheckBox* only after the callback that would need it is
+		// already built.
+		BCheckBox* onToggle = new TitleCheckBox("on", title, nullptr);
+		onToggle->SetValue(*bypass != 0 ? B_CONTROL_ON : B_CONTROL_OFF);
+		fTheme.Add(onToggle, kRolePanel, kRoleNone, kRolePanel);
+		int32 onIdx = Bind([rkr, effectId, bypass, body, onToggle, disabledReason](int32 v) {
+			if (disabledReason) {
+				// Shouldn't be reachable -- the checkbox itself is disabled
+				// below -- but a disabled BControl still technically has a
+				// message, so refuse explicitly rather than trust that.
+				onToggle->SetValue(B_CONTROL_OFF);
+				return;
+			}
+			if (v) {
+				if (!ActivateEffectSlot(rkr, effectId)) {
+					// All 10 chain slots are taken by other active effects
+					// -- refuse rather than silently turn on a pedal that
+					// will never actually process audio. Turn off one of
+					// the other active effects first.
+					onToggle->SetValue(B_CONTROL_OFF);
+					return;
+				}
+			} else {
+				DeactivateEffectSlot(rkr, effectId);
+			}
+			*bypass = v ? 1 : 0;
+			SetViewVisible(body, v != 0);
+		});
+		onToggle->SetMessage(MakeMessage(onIdx));
+		if (disabledReason) {
+			onToggle->SetEnabled(false);
+			onToggle->SetToolTip(disabledReason);
+			box->SetToolTip(disabledReason);
+		}
+		box->SetLabel(onToggle);
+		if (*bypass == 0)
+			body->Hide();
+		content->AddChild(body);
+
+		// Rendered first, same as rakarrack.cxx's own effect panels (the
+		// preset Fl_Choice always sits above every slider/toggle/type menu).
+		if (preset.items && preset.apply) {
+			AddTypeMenu(body, "Preset", "Preset", *preset.items, 0, preset.apply);
+			// Registered under the same effectId as fEffectRefreshers, for
+			// the header's Random Preset button (ApplyRandomPreset()) to
+			// pick a random item and invoke this same apply() a preset
+			// menu selection would have -- Convolotron's already does its
+			// own unlock/relock internally (see that call site), so this
+			// needs no special-casing here.
+			fPresetAppliers[effectId] = {(int32)preset.items->size(), preset.apply};
+		}
+
+		// Collects one "snap this control to getFn()'s current value" closure
+		// per type menu/toggle/slider below (each Add* pushes its own, given
+		// refreshValue+refreshers) so that, after this box is fully built,
+		// they can all be replayed together to re-prime every widget from
+		// the engine's current state -- see fEffectRefreshers/
+		// RefreshEffectBoxes() and RakarrackWindow::HandleRefsReceived()'s
+		// use of it after a Load Preset. Never touched again once this
+		// function returns.
+		std::vector<std::function<void()>> refreshers;
+
+		for (const TypeMenuDef& t : typeMenus) {
+			AddTypeMenu(body, t.label, t.label, *t.items,
+				getFn(t.npar) - t.offset,
+				[changeFn, t](int32 v) { changeFn(t.npar, v + t.offset); },
+				[getFn, t]() { return getFn(t.npar) - t.offset; }, &refreshers);
+		}
+
+		for (const ToggleDef& t : toggles) {
+			if (t.mask != 0) {
+				AddToggle(body, t.label, t.label, (getFn(t.npar) & t.mask) != 0,
+					[changeFn, getFn, t](int32 v) {
+						int32 cur = getFn(t.npar);
+						changeFn(t.npar, v ? (cur | t.mask) : (cur & ~t.mask));
+					},
+					[getFn, t]() { return getFn(t.npar) & t.mask; }, &refreshers);
+			} else {
+				AddToggle(body, t.label, t.label, getFn(t.npar) != 0,
+					[changeFn, t](int32 v) { changeFn(t.npar, v); },
+					[getFn, t]() { return getFn(t.npar); }, &refreshers);
+			}
+		}
+
+		for (const ParamDef& p : params) {
+			if (p.debounced) {
+				AddDebouncedSlider(body, p.label, p.label, p.min, p.max,
+					getFn(p.npar) - p.offset,
+					[changeFn, p](int32 v) { changeFn(p.npar, v + p.offset); },
+					[getFn, p]() { return getFn(p.npar) - p.offset; }, &refreshers);
+			} else {
+				AddSlider(body, p.label, p.label, p.min, p.max,
+					getFn(p.npar) - p.offset,
+					[changeFn, p](int32 v) { changeFn(p.npar, v + p.offset); }, 190,
+					[getFn, p]() { return getFn(p.npar) - p.offset; }, &refreshers);
+			}
+		}
+
+		if (extraWidgets)
+			extraWidgets(body);
+
+		box->AddChild(content);
+		column->AddChild(box);
+		fEffectBoxes.push_back({box, bypass});
+
+		// Re-primes this box's "On" state and every control above from the
+		// engine's CURRENT values -- exactly the same reads BuildEffectBox
+		// itself just did at construction, just replayed later. See
+		// RefreshEffectBoxes()/fEffectRefreshers' own comment for when this
+		// actually gets called.
+		//
+		// This is also the ONLY thing standing between a disabled effect
+		// (disabledReason set) and actually running: Load Preset/a Bank
+		// preset/Random Preset all set *bypass directly through
+		// Actualizar_Audio() (fileio.C), never through the "On" checkbox
+		// above, so disabling that checkbox alone does nothing against any
+		// of the three. All three call RefreshEffectBoxes() right after,
+		// which is what forces *bypass back to 0 here even though the
+		// preset just turned it on.
+		fEffectRefreshers[effectId] = [rkr, effectId, bypass, onToggle, body,
+			refreshers, disabledReason]() {
+			if (disabledReason)
+				*bypass = 0;
+			else if (*bypass != 0 && !ActivateEffectSlot(rkr, effectId))
+				*bypass = 0;
+			onToggle->SetValue(*bypass != 0 ? B_CONTROL_ON : B_CONTROL_OFF);
+			SetViewVisible(body, *bypass != 0);
+			for (const std::function<void()>& fn : refreshers)
+				fn();
+		};
+	}
+
+	// Four columns instead of five -- with each slider now ~2x as wide (see
+	// AddSlider), five columns needed more width than fits comfortably on
+	// smaller screens. Effects are grouped by roughly how many slider rows
+	// each box needs (not just effect count) so the four columns end up
+	// close to the same height rather than one column towering over the
+	// rest -- Exciter alone (13 rows: gain + 10 harmonics + 2 filters) is
+	// close to as tall as three or four small boxes put together.
+	void BuildColumn1(BView* col)
+	{
+		RKR* rkr = fRkr;
+
+		{
+			std::vector<ParamDef> exciterParams = {
+				{"Gain", 0, 127, 0, 0},
+			};
+			for (int h = 1; h <= 10; h++) {
+				static char labels[10][8];
+				snprintf(labels[h - 1], sizeof(labels[h - 1]), "Har %d", h);
+				exciterParams.push_back({labels[h - 1], -64, 64, h, 0});
+			}
+			exciterParams.push_back({"LPF", 20, 26000, 11, 0});
+			exciterParams.push_back({"HPF", 20, 20000, 12, 0});
+			BuildEffectBox(col, "Exciter", rkr, 22, &rkr->Exciter_Bypass,
+				[rkr](int32 n, int32 v) { rkr->efx_Exciter->changepar(n, v); },
+				[rkr](int32 n) { return rkr->efx_Exciter->getpar(n); },
+				exciterParams, {}, {}, nullptr,
+				{&kExciterPresetNames, [rkr](int32 v) { rkr->efx_Exciter->setpreset(v); }});
+		}
+
+		BuildEffectBox(col, "Compressor", rkr, 1, &rkr->Compressor_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Compressor->Compressor_Change(n, v); },
+			[rkr](int32 n) { return rkr->efx_Compressor->getpar(n); },
+			{
+				{"A. Time", 10, 250, 4, 0},
+				{"R. Time", 10, 500, 5, 0},
+				{"Ratio", 2, 42, 2, 0},
+				{"Knee", 0, 100, 7, 0},
+				{"Threshold", -60, -3, 1, 0},
+				{"Output", -40, 0, 3, 0},
+			}, {}, {}, nullptr,
+			{&kCompressorPresetNames, [rkr](int32 v) { rkr->efx_Compressor->Compressor_Change_Preset(1, v); }});
+
+		BuildEffectBox(col, "Valve", rkr, 19, &rkr->Valve_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Valve->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_Valve->getpar(n); },
+			{
+				{"Drive", 0, 127, 3, 0},
+				{"Level", 0, 127, 4, 0},
+				{"Dist.", 0, 127, 10, 0},
+				{"Presence", 0, 100, 12, 0},
+				{"LPF", 20, 26000, 6, 0},
+				{"HPF", 20, 20000, 7, 0},
+			}, {}, {}, nullptr,
+			{&kValvePresetNames, [rkr](int32 v) { rkr->efx_Valve->setpreset(v); }});
+
+		BuildEffectBox(col, "Vibe", rkr, 45, &rkr->Vibe_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Vibe->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_Vibe->getpar(n); },
+			{
+				{"Tempo", 1, 600, 1, 0},
+				{"Width", 0, 127, 0, 0},
+				{"Depth", 0, 127, 8, 0},
+				{"Feedback", -64, 64, 7, 64},
+				{"L/R Cr.", -64, 64, 9, 64},
+			}, {{"Stereo", 10}}, {}, nullptr,
+			{&kVibePresetNames, [rkr](int32 v) { rkr->efx_Vibe->setpreset(v); }});
+
+		BuildEffectBox(col, "Auto Pan", rkr, 13, &rkr->Pan_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Pan->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_Pan->getpar(n); },
+			{
+				{"Tempo", 1, 600, 2, 0},
+				{"Extra", 0, 127, 6, 0},
+			},
+			{
+				{"Auto Pan", 7},
+				{"Extra On", 8},
+			}, {}, nullptr,
+			{&kPanPresetNames, [rkr](int32 v) { rkr->efx_Pan->setpreset(v); }});
+
+		// Reverbtron's "IR"/"Preset" menus get the same unlock/relock
+		// treatment as Convolotron's own (see that BuildEffectBox call in
+		// BuildColumn3) for the identical reason: param 8 means setfile(),
+		// a small-but-real fopen()+fgets()/sscanf() read plus cleanup()+
+		// convert_time(), run synchronously inside Dispatch()'s jmutex lock
+		// otherwise.
+		BuildEffectBox(col, "Reverbtron", rkr, 40, &rkr->Reverbtron_Bypass,
+			[rkr](int32 n, int32 v) {
+				if (n == 8) {
+					pthread_mutex_unlock(&jmutex);
+					rkr->efx_Reverbtron->prefetchFile(v);
+					pthread_mutex_lock(&jmutex);
+					rkr->efx_Reverbtron->commitFile();
+					return;
+				}
+				rkr->efx_Reverbtron->changepar(n, v);
+			},
+			[rkr](int32 n) { return rkr->efx_Reverbtron->getpar(n); },
+			{
+				{"Wet/Dry", -64, 64, 0, 64},
+				{"Pan", -64, 63, 11, 64},
+				{"Level", 0, 127, 7, 0},
+				{"Damp", 0, 127, 6, 0},
+				{"Fb", -64, 64, 10, 0},
+				{"Length", 20, 1500, 3, 0, true},
+				{"Stretch", -64, 64, 9, 0},
+				{"I.Del", 0, 500, 5, 0},
+				{"Fade", 0, 127, 1, 0},
+				{"Diffusion", 0, 127, 15, 0},
+				{"LPF", 20, 26000, 14, 0},
+			},
+			{
+				{"Sh", 13},
+				{"ES", 12},
+				{"Safe", 2},
+			},
+			{{"IR", &kReverbtronIRNames, 8}}, nullptr,
+			{&kReverbtronPresetNames, [rkr](int32 v) {
+				pthread_mutex_unlock(&jmutex);
+				rkr->efx_Reverbtron->setpresetPrefetch(v);
+				pthread_mutex_lock(&jmutex);
+				rkr->efx_Reverbtron->setpresetCommit();
+			}});
+
+		BuildEffectBox(col, "MusDelay", rkr, 15, &rkr->MusDelay_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_MusDelay->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_MusDelay->getpar(n); },
+			{
+				{"Wet/Dry", -64, 63, 0, 64},
+				{"L/R Cr.", -64, 63, 4, 64},
+				{"Pan1", -64, 63, 1, 64},
+				{"Pan2", -64, 63, 7, 64},
+				{"Tempo", 10, 480, 10, 0},
+				{"Gain1", -64, 63, 11, 64},
+				{"Gain2", -64, 63, 12, 64},
+				{"Fb1.", 0, 127, 5, 0},
+				{"Fb2.", 0, 127, 9, 0},
+				{"Damp", 0, 127, 6, 0},
+			},
+			{},
+			{
+				{"Div 1", &kSubDivNames, 2, 1},
+				{"Div 2", &kSubDivNames, 8, 1},
+				{"Div 3", &kMusDelayDiv7Names, 3, 1},
+			}, nullptr,
+			{&kMusDelayPresetNames, [rkr](int32 v) { rkr->efx_MusDelay->setpreset(v); }});
+
+		BuildEffectBox(col, "CompBand", rkr, 43, &rkr->CompBand_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_CompBand->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_CompBand->getpar(n); },
+			{
+				{"Wet/Dry", -64, 64, 0, 64},
+				{"Gain", 0, 127, 12, 0},
+				{"L Ratio", 2, 42, 1, 0},
+				{"ML Ratio", 2, 42, 2, 0},
+				{"MH Ratio", 2, 42, 3, 0},
+				{"H Ratio", 2, 42, 4, 0},
+				{"L Thres", -70, 24, 5, 0},
+				{"ML Thres", -70, 24, 6, 0},
+				{"MH Thres", -70, 24, 7, 0},
+				{"H Thres", -70, 24, 8, 0},
+				{"Cross1", 20, 1000, 9, 0},
+				{"Cross2", 1000, 8000, 10, 0},
+				{"Cross3", 2000, 26000, 11, 0},
+			}, {}, {}, nullptr,
+			{&kCompBandPresetNames, [rkr](int32 v) { rkr->efx_CompBand->setpreset(v); }});
+
+		BuildEffectBox(col, "EQ2", rkr, 9, &rkr->EQ2_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_EQ2->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_EQ2->getpar(n); },
+			{
+				{"Gain", -64, 63, 0, 64},
+				{"Low F.", 20, 1000, 11, 0},
+				{"Low G.", -64, 63, 12, 64},
+				{"Low Q", -64, 63, 13, 64},
+				{"Mid F.", 800, 8000, 16, 0},
+				{"Mid G.", -64, 63, 17, 64},
+				{"Mid Q", -64, 63, 18, 64},
+				{"High F.", 6000, 26000, 21, 0},
+				{"High G.", -64, 63, 22, 64},
+				{"High Q", -64, 63, 23, 64},
+			}, {}, {}, nullptr,
+			{&kEQ2PresetNames, [rkr](int32 v) { rkr->EQ2_setpreset(v); }});
+
+		BuildEffectBox(col, "Arpie", rkr, 24, &rkr->Arpie_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Arpie->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_Arpie->getpar(n); },
+			{
+				{"Wet/Dry", -64, 63, 0, 64},
+				{"Arpe's", 0, 127, 7, 0},
+				{"Pan", -64, 63, 1, 64},
+				{"Tempo", 1, 600, 2, 0},
+				{"LRdl.", 0, 127, 3, 0},
+				{"L/R Cr.", -64, 63, 4, 64},
+				{"Fb.", 0, 127, 5, 0},
+				{"Damp", 0, 127, 6, 0},
+				{"Steps", 1, 8, 8, 0},
+			},
+			{},
+			{
+				{"SubDiv", &kSubDivNames, 12, 0},
+				{"Pattern", &kArpiePatternNames, 9, 0},
+			}, nullptr,
+			{&kArpiePresetNames, [rkr](int32 v) { rkr->efx_Arpie->setpreset(v); }});
+
+		BuildEffectBox(col, "Vocoder", rkr, 35, &rkr->Vocoder_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Vocoder->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_Vocoder->getpar(n); },
+			{
+				{"Wet/Dry", -64, 64, 0, 64},
+				{"Pan", -64, 64, 1, 64},
+				{"Input", 0, 127, 4, 0},
+				{"Muf.", 1, 127, 2, 0},
+				{"Q", 40, 170, 3, 0},
+				{"Ring", 0, 127, 6, 0},
+				{"Level", 0, 127, 5, 0},
+			}, {}, {}, nullptr,
+			{&kVocoderPresetNames, [rkr](int32 v) { rkr->efx_Vocoder->setpreset(v); }});
+	}
+
+	void BuildColumn2(BView* col)
+	{
+		RKR* rkr = fRkr;
+
+		{
+			static const char* kBandLabels[10] = {
+				"31 Hz", "63 Hz", "125 Hz", "250 Hz", "500 Hz", "1 Khz",
+				"2 Khz", "4 Khz", "8 Khz", "16 Khz"
+			};
+			std::vector<ParamDef> bands;
+			for (int i = 0; i < 10; i++)
+				bands.push_back({kBandLabels[i], -64, 63, 10 + i * 5 + 2, 64});
+			BuildEffectBox(col, "Equalizer", rkr, 0, &rkr->EQ1_Bypass,
+				[rkr](int32 n, int32 v) { rkr->efx_EQ1->changepar(n, v); },
+				[rkr](int32 n) { return rkr->efx_EQ1->getpar(n); },
+				bands, {}, {}, nullptr,
+				{&kEQ1PresetNames, [rkr](int32 v) { rkr->EQ1_setpreset(v); }});
+		}
+
+		BuildEffectBox(col, "Analog Phaser", rkr, 18, &rkr->APhaser_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_APhaser->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_APhaser->getpar(n); },
+			{
+				{"Tempo", 1, 600, 2, 0},
+				{"Width", 0, 127, 6, 0},
+				{"Depth", 0, 127, 11, 0},
+				{"Feedback", -64, 64, 7, 64},
+				{"Distort", 0, 100, 1, 0},
+				{"Mismatch", 0, 100, 9, 0},
+				{"Stereo", 0, 127, 5, 0},
+			}, {}, {}, nullptr,
+			{&kAPhaserPresetNames, [rkr](int32 v) { rkr->efx_APhaser->setpreset(v); }});
+
+		BuildEffectBox(col, "Phaser", rkr, 6, &rkr->Phaser_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Phaser->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_Phaser->getpar(n); },
+			{
+				{"Tempo", 1, 600, 2, 0},
+				{"Depth", 0, 127, 6, 0},
+				{"Feedback", 0, 127, 7, 0},
+				{"Phase", 0, 127, 11, 0},
+				{"Stereo", 0, 127, 5, 0},
+				{"L/R Cr.", -64, 63, 9, 64},
+			}, {}, {}, nullptr,
+			{&kPhaserPresetNames, [rkr](int32 v) { rkr->efx_Phaser->setpreset(v); }});
+
+		BuildEffectBox(col, "Overdrive", rkr, 3, &rkr->Overdrive_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Overdrive->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_Overdrive->getpar(n); },
+			{
+				{"Drive", 0, 127, 3, 0},
+				{"Level", 0, 127, 4, 0},
+				{"LPF", 20, 26000, 7, 0},
+				{"HPF", 20, 20000, 8, 0},
+			},
+			{}, {{"Type", &kDistTypeNames, 5}}, nullptr,
+			{&kOverdrivePresetNames, [rkr](int32 v) { rkr->efx_Overdrive->setpreset(1, v); }});
+
+		BuildEffectBox(col, "Opticaltrem", rkr, 44, &rkr->Opticaltrem_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Opticaltrem->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_Opticaltrem->getpar(n); },
+			{
+				{"Depth", 0, 127, 0, 0},
+				{"Tempo", 1, 600, 1, 0},
+				{"Rnd", 0, 127, 2, 0},
+				{"Stereo", 0, 127, 4, 0},
+			}, {{"Invert", 6}}, {}, nullptr,
+			{&kOpticaltremPresetNames, [rkr](int32 v) { rkr->efx_Opticaltrem->setpreset(v); }});
+
+		BuildEffectBox(col, "MBDist", rkr, 23, &rkr->MBDist_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_MBDist->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_MBDist->getpar(n); },
+			{
+				{"Wet/Dry", -64, 64, 0, 64},
+				{"L/R Cr.", -64, 64, 2, 64},
+				{"Drive", 0, 127, 3, 0},
+				{"Level", 0, 127, 4, 0},
+				{"L.Gain", 0, 100, 8, 0},
+				{"M.Gain", 0, 100, 9, 0},
+				{"H.Gain", 0, 100, 10, 0},
+				{"Cross1", 20, 1000, 12, 0},
+				{"Cross2", 800, 12000, 13, 0},
+				{"Pan", -64, 64, 1, 64},
+			},
+			{
+				{"Stereo", 14},
+				{"Neg.", 11},
+			},
+			{
+				{"Type L", &kDistTypeNames, 5},
+				{"Type M", &kDistTypeNames, 6},
+				{"Type H", &kDistTypeNames, 7},
+			}, nullptr,
+			{&kMBDistPresetNames, [rkr](int32 v) { rkr->efx_MBDist->setpreset(v); }});
+
+		// Same unlock/relock treatment as Convolotron/Reverbtron's "IR"/
+		// "Preset" menus, and for the same reason -- see this file's
+		// Reverbtron BuildEffectBox call for the fuller comment. This is
+		// the effect that actually surfaced the need for it in practice:
+		// "Suction" (preset 4 below) is an Echotron factory preset, and
+		// selecting a bank preset that turns Echotron on with it flooded
+		// the audio backend before this fix.
+		BuildEffectBox(col, "Echotron", rkr, 41, &rkr->Echotron_Bypass,
+			[rkr](int32 n, int32 v) {
+				if (n == 8) {
+					pthread_mutex_unlock(&jmutex);
+					rkr->efx_Echotron->prefetchFile(v);
+					pthread_mutex_lock(&jmutex);
+					rkr->efx_Echotron->commitFile();
+					return;
+				}
+				rkr->efx_Echotron->changepar(n, v);
+			},
+			[rkr](int32 n) { return rkr->efx_Echotron->getpar(n); },
+			{
+				{"Wet/Dry", -64, 64, 0, 64},
+				{"Pan", -64, 63, 11, 64},
+				{"Tempo", 1, 600, 5, 0},
+				{"Damp", 0, 127, 6, 0},
+				{"Fb", -64, 64, 10, 0},
+				{"L/R Cr.", -64, 64, 7, 64},
+				{"Width", 0, 127, 2, 0},
+				{"Depth", -64, 64, 1, 64},
+				{"St.df", 0, 127, 9, 0},
+				{"#", 1, 127, 3, 0, true},
+			},
+			{
+				{"AF", 15},
+				{"MF", 13},
+				{"MD", 12},
+			},
+			{
+				{"LFO Type", &kLfoTypeNames, 14},
+				{"IR", &kEchotronIRNames, 8},
+			}, nullptr,
+			{&kEchotronPresetNames, [rkr](int32 v) {
+				pthread_mutex_unlock(&jmutex);
+				rkr->efx_Echotron->setpresetPrefetch(v);
+				pthread_mutex_lock(&jmutex);
+				rkr->efx_Echotron->setpresetCommit();
+			}});
+
+		BuildEffectBox(col, "Distortion", rkr, 2, &rkr->Distorsion_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Distorsion->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_Distorsion->getpar(n); },
+			{
+				{"Wet/Dry", -64, 63, 0, 64},
+				{"L/R Cr.", -64, 63, 2, 64},
+				{"Drive", 0, 127, 3, 0},
+				{"Level", 0, 127, 4, 0},
+				{"Pan", -64, 63, 1, 64},
+				{"Sub Octv", 0, 127, 12, 0},
+				{"LPF", 20, 26000, 7, 0},
+				{"HPF", 20, 20000, 8, 0},
+			},
+			{
+				{"Neg.", 6},
+				{"Pre Filter", 10},
+				{"Stereo", 9},
+			},
+			{{"Type", &kDistTypeNames, 5}}, nullptr,
+			{&kDistorsionPresetNames, [rkr](int32 v) { rkr->efx_Distorsion->setpreset(0, v + 2); }});
+
+		BuildEffectBox(col, "Harmonizer", rkr, 14, &rkr->Harmonizer_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Har->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_Har->getpar(n); },
+			{
+				{"Wet/Dry", -64, 63, 0, 64},
+				{"Int.", -12, 12, 3, 12},
+				{"Gain", -64, 63, 2, 64},
+				{"Pan", -64, 63, 1, 64},
+				{"Freq", 20, 26000, 4, 0},
+				{"Gain 2", -64, 63, 8, 64},
+				{"Q", -64, 63, 9, 64},
+				{"Note", 0, 23, 6, 0},
+				{"Chord", 0, 33, 7, 0},
+			},
+			{
+				{"MIDI", 10},
+				{"SEL", 5},
+			}, {}, nullptr,
+			{&kHarmonizerPresetNames, [rkr](int32 v) { rkr->efx_Har->setpreset(v); }});
+
+		BuildEffectBox(col, "Shifter", rkr, 38, &rkr->Shifter_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Shifter->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_Shifter->getpar(n); },
+			{
+				{"Wet/Dry", -64, 63, 0, 64},
+				{"Int.", 0, 12, 6, 0},
+				{"Gain", -64, 63, 2, 64},
+				{"Pan", -64, 63, 1, 64},
+				{"Attack", 1, 2000, 3, 0},
+				{"Decay", 1, 2000, 4, 0},
+				{"Threshold", -70, 20, 5, 0},
+				{"Whamy", 0, 127, 9, 0},
+			},
+			{
+				{"Down", 7},
+			},
+			{{"Mode", &kShifterModeNames, 8}}, nullptr,
+			{&kShifterPresetNames, [rkr](int32 v) { rkr->efx_Shifter->setpreset(v); }});
+
+		BuildEffectBox(col, "ShelfBoost", rkr, 34, &rkr->ShelfBoost_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_ShelfBoost->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_ShelfBoost->getpar(n); },
+			{
+				{"Gain", 0, 127, 0, 0},
+				{"Level", 1, 127, 4, 0},
+				{"Tone", 220, 16000, 2, 0},
+				{"Pres.", -64, 64, 1, 0},
+			},
+			{
+				{"Stereo", 3},
+			}, {}, nullptr,
+			{&kShelfBoostPresetNames, [rkr](int32 v) { rkr->efx_ShelfBoost->setpreset(v); }});
+
+		BuildEffectBox(col, "Cabinet", rkr, 12, &rkr->Cabinet_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Cabinet->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_Cabinet->getpar(n); },
+			{
+				{"Gain", -64, 63, 0, 64},
+			}, {}, {}, nullptr,
+			{&kCabinetPresetNames, [rkr](int32 v) { rkr->Cabinet_setpreset(v); }});
+	}
+
+	void BuildColumn3(BView* col)
+	{
+		RKR* rkr = fRkr;
+
+		BuildEffectBox(col, "Ring Modulator", rkr, 21, &rkr->Ring_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Ring->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_Ring->getpar(n); },
+			{
+				{"Input", 1, 127, 11, 0},
+				{"Level", 0, 127, 3, 0},
+				{"Depth", 0, 100, 4, 0},
+				{"Freq", 1, 20000, 5, 0},
+				{"Sin", 0, 100, 7, 0},
+				{"Tri", 0, 100, 8, 0},
+				{"Saw", 0, 100, 9, 0},
+				{"Squ", 0, 100, 10, 0},
+			}, {}, {}, nullptr,
+			{&kRingPresetNames, [rkr](int32 v) { rkr->efx_Ring->setpreset(v); }});
+
+		// Reverb (only Reverb, per real-world testing -- runaway volume,
+		// clicking/popping, confirmed reproducible from simply enabling it,
+		// no parameter touched) is unstable above 48kHz on Haiku, root
+		// cause not identified (not the SliderW/changepar() data race fixed
+		// elsewhere, not the comb-filter realloc's own cost -- see that
+		// code's own comments). This used to be a plain warning dialog at
+		// startup (jack.C's JACKstart(), removed) telling the user to
+		// switch Haiku's Media preferences or expect trouble; now the
+		// checkbox itself is disabled instead, so it's simply not possible
+		// to hit the bug rather than being warned and left to hit it
+		// anyway. static: SAMPLE_RATE is fixed for the process's lifetime
+		// (every effect sizes its own buffers from it once, at
+		// construction -- see HaikuDetectAudioSettingsEarly()'s own
+		// comment), so this only needs computing once, and disabledReason
+		// is captured by BuildEffectBox's lambdas for the life of the
+		// session -- it must outlive this function call, which a stack
+		// buffer wouldn't.
+		static char reverbDisabledMsg[192];
+		const char* reverbDisabledReason = nullptr;
+		if (SAMPLE_RATE > 48000) {
+			snprintf(reverbDisabledMsg, sizeof(reverbDisabledMsg),
+				"Disabled: Reverb is unstable above 48 kHz on Haiku (runaway "
+				"volume, clicking/popping). Your audio is running at %u Hz -- "
+				"set Haiku's Media preferences to 48000 Hz to use it.",
+				SAMPLE_RATE);
+			reverbDisabledReason = reverbDisabledMsg;
+		}
+
+		BuildEffectBox(col, "Reverb", rkr, 8, &rkr->Reverb_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Rev->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_Rev->getpar(n); },
+			{
+				{"Time", 0, 127, 2, 0},
+				{"I.Del", 0, 127, 3, 0},
+				{"Del.E/R", 0, 127, 4, 0},
+				{"LPF", 20, 26000, 7, 0},
+				{"HPF", 20, 20000, 8, 0},
+				{"Damp", 64, 127, 9, 0},
+				{"R.Size", 1, 127, 11, 0},
+			}, {}, {}, nullptr,
+			{&kReverbPresetNames, [rkr](int32 v) { rkr->efx_Rev->setpreset(v); }},
+			reverbDisabledReason);
+
+		std::vector<ParamDef> chorusFlangerParams = {
+			{"Wet/Dry", -64, 63, 0, 64},
+			{"Pan", -64, 63, 1, 64},
+			{"Tempo", 1, 600, 2, 0},
+			{"Rnd", 0, 127, 3, 0},
+			{"Depth", 0, 127, 6, 0},
+			{"Delay", 0, 127, 7, 0},
+			{"Feedback", 0, 127, 8, 0},
+			{"Stereo", 0, 127, 5, 0},
+			{"L/R Cr.", -64, 63, 9, 64},
+		};
+
+		BuildEffectBox(col, "Flanger", rkr, 7, &rkr->Flanger_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Flanger->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_Flanger->getpar(n); },
+			chorusFlangerParams, {{"Subtract", 11}, {"Intense", 12}},
+			{{"LFO Type", &kLfoTypeNames, 4}}, nullptr,
+			{&kFlangerPresetNames, [rkr](int32 v) { rkr->efx_Flanger->setpreset(1, v + 5); }});
+
+		BuildEffectBox(col, "Alienwah", rkr, 11, &rkr->Alienwah_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Alienwah->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_Alienwah->getpar(n); },
+			{
+				{"Tempo", 1, 600, 2, 0},
+				{"Depth", 0, 127, 6, 0},
+				{"Feedback", 0, 127, 7, 0},
+				{"Delay", 0, 127, 8, 0},
+				{"Phase", 0, 127, 10, 0},
+			}, {}, {}, nullptr,
+			{&kAlienwahPresetNames, [rkr](int32 v) { rkr->efx_Alienwah->setpreset(v); }});
+
+		BuildEffectBox(col, "Echo", rkr, 4, &rkr->Echo_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Echo->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_Echo->getpar(n); },
+			{
+				{"Delay", 20, 2000, 2, 0},
+				{"Feedback", 0, 127, 5, 0},
+				{"Damp", 0, 127, 6, 0},
+				{"L/R Cr.", -64, 63, 4, 64},
+			}, {}, {}, nullptr,
+			{&kEchoPresetNames, [rkr](int32 v) { rkr->efx_Echo->setpreset(v); }});
+
+		BuildEffectBox(col, "Sustainer", rkr, 36, &rkr->Sustainer_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Sustainer->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_Sustainer->getpar(n); },
+			{
+				{"Gain", 0, 127, 0, 0},
+				{"Sustain", 1, 127, 1, 0},
+			}, {}, {}, nullptr,
+			{&kSustainerPresetNames, [rkr](int32 v) { rkr->efx_Sustainer->setpreset(v); }});
+
+		BuildEffectBox(col, "Synthfilter", rkr, 27, &rkr->Synthfilter_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Synthfilter->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_Synthfilter->getpar(n); },
+			{
+				{"Wet/Dry", -64, 63, 0, 64},
+				{"Distort", 0, 127, 1, 0},
+				{"Tempo", 1, 600, 2, 0},
+				{"St.df", 0, 127, 5, 0},
+				{"Width", 0, 127, 6, 0},
+				{"Fb", -64, 64, 7, 0},
+				{"Depth", 0, 127, 11, 0},
+				{"E.Sens", -64, 64, 12, 0},
+				{"A.Time", 5, 1000, 13, 0},
+				{"R.Time", 5, 500, 14, 0},
+				{"Offset", 0, 127, 15, 0},
+				{"LPF Stg.", 0, 12, 8, 0},
+				{"HPF Stg.", 0, 12, 9, 0},
+			},
+			{
+				{"Subtr.", 10},
+			},
+			{{"LFO Type", &kLfoTypeNames, 4}}, nullptr,
+			{&kSynthfilterPresetNames, [rkr](int32 v) { rkr->efx_Synthfilter->setpreset(v); }});
+
+		BuildEffectBox(col, "DFlange", rkr, 20, &rkr->DFlange_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_DFlange->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_DFlange->getpar(n); },
+			{
+				{"Wet/Dry", -64, 64, 0, 0},
+				{"Pan", -64, 64, 1, 0},
+				{"L/R Cr.", 0, 127, 2, 0},
+				{"Depth", 20, 500, 3, 0},
+				{"Width", 0, 3000, 4, 0},
+				{"Offset", 0, 100, 5, 0},
+				{"Fb", -64, 64, 6, 0},
+				{"LPF", 20, 20000, 7, 0},
+				{"Tempo", 1, 600, 10, 0},
+				{"St.df", 0, 127, 11, 0},
+				{"Rnd", 0, 127, 13, 0},
+			},
+			{
+				{"Subtract", 8},
+				{"Th. zero", 9},
+				{"Intense", 14},
+			},
+			{{"LFO Type", &kLfoTypeNames, 12}}, nullptr,
+			{&kDFlangePresetNames, [rkr](int32 v) { rkr->efx_DFlange->setpreset(v); }});
+
+		BuildEffectBox(col, "RyanWah", rkr, 31, &rkr->RyanWah_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_RyanWah->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_RyanWah->getpar(n); },
+			{
+				{"Wet/Dry", -64, 63, 0, 64},
+				{"LP", -64, 64, 10, 0},
+				{"BP", -64, 64, 11, 0},
+				{"HP", -64, 64, 12, 0},
+				{"Width", 0, 127, 6, 0},
+				{"Tempo", 1, 600, 2, 0},
+				{"Res.", 1, 127, 1, 0},
+				{"Range", 10, 6000, 14, 0},
+				{"Wah", 0, 127, 8, 0},
+				{"E.Sens", -64, 64, 7, 0},
+				{"Smooth", 0, 127, 9, 0},
+				{"Stg", 1, 12, 13, 0},
+			},
+			{
+				{"M", 17, 1},
+				{"N", 17, 2},
+			},
+			{{"LFO", &kLfoTypeNames, 4}}, nullptr,
+			{&kRyanWahPresetNames, [rkr](int32 v) { rkr->efx_RyanWah->setpreset(v); }});
+
+		BuildEffectBox(col, "Shuffle", rkr, 26, &rkr->Shuffle_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Shuffle->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_Shuffle->getpar(n); },
+			{
+				{"Wet/Dry", -64, 64, 0, 64},
+				{"Low Freq", 20, 1000, 5, 0},
+				{"Low Gain", -64, 64, 1, 0},
+				{"M.L Freq", 400, 4000, 6, 0},
+				{"M.L Gain", -64, 64, 2, 0},
+				{"M.H Freq", 1200, 8000, 7, 0},
+				{"M.H Gain", -64, 64, 3, 0},
+				{"High Freq", 6000, 26000, 8, 0},
+				{"High Gain", -64, 64, 4, 0},
+				{"Q", -64, 64, 9, 0},
+			},
+			{
+				{"Rev", 10},
+			}, {}, nullptr,
+			{&kShufflePresetNames, [rkr](int32 v) { rkr->efx_Shuffle->setpreset(v); }});
+
+		BuildEffectBox(col, "RBEcho", rkr, 32, &rkr->RBEcho_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_RBEcho->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_RBEcho->getpar(n); },
+			{
+				{"Wet/Dry", -64, 63, 0, 64},
+				{"Reverse", 0, 127, 7, 0},
+				{"Pan", -64, 63, 1, 64},
+				{"Tempo", 1, 600, 2, 0},
+				{"LRdl.", 0, 127, 3, 0},
+				{"Fb.", 0, 127, 5, 0},
+				{"Damp", 0, 127, 6, 0},
+				{"E.S.", 0, 127, 9, 0},
+				{"Angle", -64, 64, 4, 64},
+			},
+			{},
+			{{"SubDiv", &kSubDivNames, 8}}, nullptr,
+			{&kRBEchoPresetNames, [rkr](int32 v) { rkr->efx_RBEcho->setpreset(v); }});
+
+		// Convolotron's "IR" menu (param 8) and its "Preset" menu (which sets
+		// 11 params including that same IR file) both end up in setfile() --
+		// disk I/O plus a Blackman-window/normalization pass over the whole
+		// impulse response. Called the normal way, that runs synchronously
+		// inside Dispatch(), which MessageReceived already holds jmutex for
+		// -- exactly the same real-time-audio lock jack.C's callback needs
+		// every ~PERIOD samples (see jmutex's own comment there). A slider
+		// drag gets away with this because AddDebouncedSlider() coalesces
+		// it into one call after the drag settles, but a single menu pick
+		// already IS one call -- there's nothing left to coalesce, and disk
+		// I/O can stall the lock far longer than the audio callback can
+		// tolerate, which is what was flooding the backend with buffer
+		// underruns. Both paths below instead unlock for just the file
+		// read/resample (prefetchIR(), which only ever touches Convolotron's
+		// private scratch buffers -- never rbuf/buf/length, which out()
+		// reads every callback) and relock only to commit the result
+		// (commitIR()), so the audio thread can keep servicing callbacks
+		// while the disk read is in flight.
+		BuildEffectBox(col, "Convolotron", rkr, 29, &rkr->Convol_Bypass,
+			[rkr](int32 n, int32 v) {
+				if (n == 8) {
+					pthread_mutex_unlock(&jmutex);
+					rkr->efx_Convol->prefetchIR(v);
+					pthread_mutex_lock(&jmutex);
+					rkr->efx_Convol->commitIR();
+					return;
+				}
+				rkr->efx_Convol->changepar(n, v);
+			},
+			[rkr](int32 n) { return rkr->efx_Convol->getpar(n); },
+			{
+				{"Wet/Dry", -64, 64, 0, 64},
+				{"Pan", -64, 63, 1, 64},
+				{"Level", 0, 127, 7, 0},
+				{"Damp", 0, 127, 6, 0},
+				{"Fb", -64, 64, 10, 0},
+				{"Length", 5, 250, 3, 0, true},
+			},
+			{
+				{"Safe Mode", 2},
+			},
+			{{"IR", &kConvolIRNames, 8}}, nullptr,
+			{&kConvolotronPresetNames, [rkr](int32 v) {
+				pthread_mutex_unlock(&jmutex);
+				rkr->efx_Convol->setpresetPrefetch(v);
+				pthread_mutex_lock(&jmutex);
+				rkr->efx_Convol->setpresetCommit();
+			}});
+
+		BuildEffectBox(col, "Infinity", rkr, 46, &rkr->Infinity_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Infinity->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_Infinity->getpar(n); },
+			{
+				{"Wet/Dry", -64, 63, 0, 64},
+				{"Res", -1000, 1000, 9, 0},
+				{"1", -64, 64, 1, 0},
+				{"2", -64, 64, 2, 0},
+				{"3", -64, 64, 3, 0},
+				{"4", -64, 64, 4, 0},
+				{"5", -64, 64, 5, 0},
+				{"6", -64, 64, 6, 0},
+				{"7", -64, 64, 7, 0},
+				{"8", -64, 64, 8, 0},
+				{"Stages", 1, 12, 17, 0},
+				{"AutoPan", 0, 127, 15, 0},
+				{"St.df", -64, 64, 13, 0},
+				{"Start", 0, 127, 10, 0},
+				{"End", 0, 127, 11, 0},
+				{"Tempo", 1, 600, 12, 0},
+				{"Subdiv", -16, 16, 14, 0},
+			},
+			{
+				{"Rev", 16},
+			}, {}, nullptr,
+			{&kInfinityPresetNames, [rkr](int32 v) { rkr->efx_Infinity->setpreset(v); }});
+	}
+
+	void BuildColumn4(BView* col)
+	{
+		RKR* rkr = fRkr;
+
+		std::vector<ParamDef> chorusFlangerParams = {
+			{"Wet/Dry", -64, 63, 0, 64},
+			{"Pan", -64, 63, 1, 64},
+			{"Tempo", 1, 600, 2, 0},
+			{"Rnd", 0, 127, 3, 0},
+			{"Depth", 0, 127, 6, 0},
+			{"Delay", 0, 127, 7, 0},
+			{"Feedback", 0, 127, 8, 0},
+			{"Stereo", 0, 127, 5, 0},
+			{"L/R Cr.", -64, 63, 9, 64},
+		};
+
+		BuildEffectBox(col, "Derelict", rkr, 17, &rkr->NewDist_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_NewDist->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_NewDist->getpar(n); },
+			{
+				{"Drive", 1, 127, 3, 0},
+				{"Level", 0, 127, 4, 0},
+				{"Color", 0, 127, 9, 0},
+				{"Sub Octv", 0, 127, 11, 0},
+				{"LPF", 20, 26000, 7, 0},
+				{"HPF", 20, 20000, 8, 0},
+			},
+			{}, {{"Type", &kDistTypeNames, 5}}, nullptr,
+			{&kNewDistPresetNames, [rkr](int32 v) { rkr->efx_NewDist->setpreset(v); }});
+
+		BuildEffectBox(col, "Noise Gate", rkr, 16, &rkr->Gate_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Gate->Gate_Change(n, v); },
+			[rkr](int32 n) { return rkr->efx_Gate->getpar(n); },
+			{
+				{"A. Time", 1, 250, 3, 0},
+				{"R. Time", 2, 250, 4, 0},
+				{"Range", -90, 0, 2, 0},
+				{"Threshold", -70, 20, 1, 0},
+				{"Hold", 2, 500, 7, 0},
+				{"LPF", 20, 26000, 5, 0},
+				{"HPF", 20, 20000, 6, 0},
+			}, {}, {}, nullptr,
+			{&kGatePresetNames, [rkr](int32 v) { rkr->efx_Gate->Gate_Change_Preset(v); }});
+
+		BuildEffectBox(col, "Chorus", rkr, 5, &rkr->Chorus_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Chorus->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_Chorus->getpar(n); },
+			chorusFlangerParams, {{"Subtract", 11}, {"Intense", 12}},
+			{{"LFO Type", &kLfoTypeNames, 4}}, nullptr,
+			{&kChorusPresetNames, [rkr](int32 v) { rkr->efx_Chorus->setpreset(0, v); }});
+
+		BuildEffectBox(col, "StompBox", rkr, 39, &rkr->StompBox_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_StompBox->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_StompBox->getpar(n); },
+			{
+				{"Level", 0, 127, 0, 0},
+				{"Gain", 0, 127, 4, 0},
+				{"Low", -64, 64, 3, 0},
+				{"Mid", -64, 64, 2, 0},
+				{"High", -64, 64, 1, 0},
+			},
+			{}, {{"Mode", &kStompBoxModeNames, 5}}, nullptr,
+			{&kStompBoxPresetNames, [rkr](int32 v) { rkr->efx_StompBox->setpreset(v); }});
+
+		BuildEffectBox(col, "WhaWha", rkr, 10, &rkr->WhaWha_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_WhaWha->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_WhaWha->getpar(n); },
+			{
+				{"Tempo", 1, 600, 2, 0},
+				{"Depth", 0, 127, 6, 0},
+				{"Amp.Sens", 0, 127, 7, 0},
+				{"Smooth", 0, 127, 9, 0},
+			}, {}, {}, nullptr,
+			{&kWhaWhaPresetNames, [rkr](int32 v) { rkr->efx_WhaWha->setpreset(v); }});
+
+		BuildEffectBox(col, "Looper", rkr, 30, &rkr->Looper_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Looper->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_Looper->getpar(n); },
+			{
+				{"Wet/Dry", -64, 63, 0, 64},
+				{"Level 1", 0, 127, 6, 0},
+				{"Level 2", 0, 127, 10, 0},
+				{"Tempo", 20, 380, 14, 0},
+			},
+			{
+				{"Reverse", 5},
+				{"Auto Play", 9},
+				{"R1", 11},
+				{"R2", 12},
+				{"Lnk", 13},
+				{"M", 16},
+			},
+			{
+				{"Time Sig.", &kLooperBarNames, 15},
+				{"MS", &kLooperMsNames, 17},
+			},
+			[this, rkr](BView* body) {
+				// Plain momentary presses (Fl_Button in rakarrack.cxx, each
+				// just a changepar(npar, 1) call) rather than sliders,
+				// toggles, or dropdowns -- see AddButton().
+				BGroupView* transport = new BGroupView(B_HORIZONTAL, 4);
+				fTheme.Add(transport, kRolePanel);
+				body->AddChild(transport);
+				AddButton(transport, "play", "Play", 1,
+					[rkr](int32) { rkr->efx_Looper->changepar(1, 1); });
+				AddButton(transport, "stop", "Stop", 1,
+					[rkr](int32) { rkr->efx_Looper->changepar(2, 1); });
+				AddButton(transport, "record", "Rec", 1,
+					[rkr](int32) { rkr->efx_Looper->changepar(3, 1); });
+				AddButton(transport, "clear", "Clear", 1,
+					[rkr](int32) { rkr->efx_Looper->changepar(4, 1); });
+				AddButton(transport, "t1", "Trk 1", 1,
+					[rkr](int32) { rkr->efx_Looper->changepar(7, 1); });
+				AddButton(transport, "t2", "Trk 2", 1,
+					[rkr](int32) { rkr->efx_Looper->changepar(8, 1); });
+			},
+			{&kLooperPresetNames, [rkr](int32 v) { rkr->efx_Looper->setpreset(v); }});
+
+		BuildEffectBox(col, "Sequence", rkr, 37, &rkr->Sequence_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Sequence->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_Sequence->getpar(n); },
+			{
+				{"Wet/Dry", -64, 64, 8, 64},
+				{"1", 0, 127, 0, 0},
+				{"2", 0, 127, 1, 0},
+				{"3", 0, 127, 2, 0},
+				{"4", 0, 127, 3, 0},
+				{"5", 0, 127, 4, 0},
+				{"6", 0, 127, 5, 0},
+				{"7", 0, 127, 6, 0},
+				{"8", 0, 127, 7, 0},
+				{"Tempo", 1, 600, 9, 0},
+				{"Q", -64, 64, 10, 64},
+				{"St.df", 0, 7, 12, 0},
+				{"Range", 1, 8, 14, 0},
+			},
+			{
+				{"Amp.", 11},
+			},
+			{{"Mode", &kSeqModeNames, 13}}, nullptr,
+			{&kSequencePresetNames, [rkr](int32 v) { rkr->efx_Sequence->setpreset(v); }});
+
+		BuildEffectBox(col, "StereoHarm", rkr, 42, &rkr->StereoHarm_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_StereoHarm->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_StereoHarm->getpar(n); },
+			{
+				{"Wet/Dry", -64, 63, 0, 64},
+				{"Int L", -12, 12, 2, 12},
+				{"Chrm L", -2000, 2000, 3, 0},
+				{"Gain L", -64, 64, 1, 64},
+				{"Int R", -12, 12, 5, 12},
+				{"Chrm R", -2000, 2000, 6, 0},
+				{"Gain R", -64, 64, 4, 64},
+				{"L/R Cr.", -64, 64, 11, 64},
+				{"Note", 0, 23, 8, 0},
+				{"Chord", 0, 33, 9, 0},
+			},
+			{
+				{"MIDI", 10},
+				{"SEL", 7},
+			}, {}, nullptr,
+			{&kStereoHarmPresetNames, [rkr](int32 v) { rkr->efx_StereoHarm->setpreset(v); }});
+
+		BuildEffectBox(col, "MBVvol", rkr, 28, &rkr->MBVvol_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_MBVvol->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_MBVvol->getpar(n); },
+			{
+				{"Wet/Dry", -64, 63, 0, 64},
+				{"Tempo 1", 1, 600, 1, 0},
+				{"St.df 1", 0, 127, 3, 0},
+				{"Tempo 2", 1, 600, 4, 0},
+				{"St.df 2", 0, 127, 6, 0},
+				{"Cross1", 20, 1000, 7, 0},
+				{"Cross2", 1000, 8000, 8, 0},
+				{"Cross3", 2000, 26000, 9, 0},
+			},
+			{},
+			{
+				{"LFO 1", &kLfoTypeNames, 2},
+				{"LFO 2", &kLfoTypeNames, 5},
+				{"Combi", &kMBVvolCombiNames, 10},
+			}, nullptr,
+			{&kMBVvolPresetNames, [rkr](int32 v) { rkr->efx_MBVvol->setpreset(v); }});
+
+		BuildEffectBox(col, "CoilCrafter", rkr, 33, &rkr->CoilCrafter_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_CoilCrafter->changepar(n, v); },
+			[rkr](int32 n) { return rkr->efx_CoilCrafter->getpar(n); },
+			{
+				{"Gain", 0, 127, 0, 0},
+				{"Tone", 20, 4400, 7, 0},
+				{"Freq1", 2600, 4500, 3, 0},
+				{"Q1", 10, 65, 4, 0},
+				{"Freq2", 2600, 4500, 5, 0},
+				{"Q2", 10, 65, 6, 0},
+			},
+			{
+				{"Pos.", 8},
+			},
+			{
+				{"Origin", &kCoilOriginNames, 1},
+				{"Destiny", &kCoilOriginNames, 2},
+			}, nullptr,
+			{&kCoilCrafterPresetNames, [rkr](int32 v) { rkr->efx_CoilCrafter->setpreset(v); }});
+
+		BuildEffectBox(col, "Expander", rkr, 25, &rkr->Expander_Bypass,
+			[rkr](int32 n, int32 v) { rkr->efx_Expander->Expander_Change(n, v); },
+			[rkr](int32 n) { return rkr->efx_Expander->getpar(n); },
+			{
+				{"A. Time", 10, 2000, 3, 0},
+				{"R. Time", 10, 500, 4, 0},
+				{"Shape", 1, 50, 2, 0},
+				{"Thrhold", -80, 0, 1, 0},
+				{"Level", 1, 127, 7, 0},
+				{"LPF", 20, 26000, 5, 0},
+				{"HPF", 20, 20000, 6, 0},
+			}, {}, {}, nullptr,
+			{&kExpanderPresetNames, [rkr](int32 v) { rkr->efx_Expander->Expander_Change_Preset(v); }});
+	}
+
+	RKR* fRkr;
+	// Every themed view in the main window -- the rack, the header
+	// RakarrackWindow builds through BuildHeader(), and the header/scroller
+	// views RakarrackWindow colors itself via Themes(). See ApplyTheme().
+	ThemeRegistry fTheme;
+	BStringView* fCpuDisplay;
+	BCheckBox* fMasterFX;
+	OrderWindow* fOrderWindow = nullptr;
+	std::vector<std::function<void(int32)>> fActions;
+	std::vector<BMenu*> fMenus;
+	std::deque<DebouncedSlider> fDebounced;
+
+	// "Hide Inactive Effects" + the "Max Concurrent Effects Allowed: N of
+	// 10" status line below the CPU display -- see BuildHeader and
+	// RefreshEffectVisibility()/Pulse() below. Every BuildEffectBox() call
+	// registers its box and bypass pointer here; *bypass != 0 for a
+	// registered effect means it currently occupies one of the engine's 10
+	// efx_order[] slots (BuildEffectBox only lets *bypass go non-zero via
+	// ActivateEffectSlot() succeeding -- see that function's own comment),
+	// so counting non-zero bypass flags here is exactly the same count as
+	// walking efx_order[] itself.
+	struct EffectBoxEntry {
+		BBox* box;
+		int* bypass;
+	};
+	std::vector<EffectBoxEntry> fEffectBoxes;
+	BCheckBox* fHideInactive = nullptr;
+	BStringView* fMaxEffectsLabel = nullptr;
+
+	// Tap Tempo panel state (see BuildHeader). fTapNeedsRefresh asks
+	// Pulse() to re-read every effect box after something changed all their
+	// tempo parameters at once (Update_tempo()).
+	BCheckBox* fTapOn = nullptr;
+	BGroupView* fTapBody = nullptr;
+	std::vector<std::function<void()>> fTapRefreshers;
+	bool fTapNeedsRefresh = false;
+	bool fTapTempoDirty = false;
+	bool fHideInactiveEffects = false;
+	BStringView* fPresetNameLabel = nullptr;
+
+	// Shows/hides every registered effect box to match fHideInactiveEffects
+	// and each box's current bypass state. Safe to call repeatedly (from
+	// Pulse(), since a box's own "On" toggle can flip its bypass at any
+	// time) -- BView::Hide()/Show() nest via a counter, so this only calls
+	// whichever one actually changes a box's visibility, never both.
+	void RefreshEffectVisibility()
+	{
+		for (EffectBoxEntry& e : fEffectBoxes) {
+			bool active = (*e.bypass != 0);
+			SetViewVisible(e.box, !fHideInactiveEffects || active);
+		}
+	}
+
+public:
+	// One "re-prime every widget in this box from getFn()" closure per
+	// effect, built by BuildEffectBox regardless of which effect it is --
+	// see that function's own "refreshers" comment. Keyed by the same
+	// effect-type ID BypassPtrForId()/efx_order[] use.
+	std::map<int, std::function<void()>> fEffectRefreshers;
+
+	// Re-syncs the given effects' on-screen controls (On toggle, sliders,
+	// toggles, type menus) with whatever the engine's current parameter
+	// values actually are. Called by RakarrackWindow::HandleRefsReceived()
+	// right after a Load Preset -- loadfile() changes the engine and audio
+	// immediately, but every widget here was only ever primed once, at its
+	// own construction, so without this the on-screen positions would keep
+	// showing whatever was there before the load. Silently does nothing for
+	// an effectId this session hasn't wired a refresher for.
+	void RefreshEffectBoxes(const std::vector<int>& effectIds)
+	{
+		for (int id : effectIds) {
+			auto it = fEffectRefreshers.find(id);
+			if (it != fEffectRefreshers.end())
+				it->second();
+		}
+	}
+
+	// One entry per effect that has a "Preset" dropdown (see BuildEffectBox's
+	// "preset" parameter) -- apply() is the exact same closure that dropdown
+	// itself invokes on selection (PresetMenuDef::apply, e.g. Convolotron's
+	// own unlock/relock-wrapped one), count is how many items it has. Used
+	// by ApplyRandomPreset() to pick and apply a random one per effect, the
+	// same thing rakarrack.cxx's own RandomPreset() does to each of its ten
+	// chosen effects' Preset Fl_Choice.
+	struct PresetApplierEntry {
+		int32 count;
+		std::function<void(int32)> apply;
+	};
+	std::map<int, PresetApplierEntry> fPresetAppliers;
+
+	// Refreshes the header's "Current Preset: ..." label from rkr->Preset_Name
+	// -- set by loadfile() (Load Preset) and Bank_to_Preset() (the Bank 1/2/3
+	// dropdowns) alike, so this one read covers both sources. Left alone
+	// (not called) after ApplyRandomPreset(), matching rakarrack.cxx's own
+	// RandomPreset(), which never touches Preset_Name either.
+	void RefreshPresetName()
+	{
+		if (!fRkr || !fPresetNameLabel)
+			return;
+		char buf[96];
+		snprintf(buf, sizeof(buf), "Current Preset: %s", fRkr->Preset_Name);
+		fPresetNameLabel->SetText(buf);
+	}
+
+	// Handles a Bank 1/2/3 dropdown selection (see BuildHeader's
+	// buildBankMenu and MSG_BANK_PRESET) -- bank is 0/1/2 for Default/
+	// Extra/Extra1.rkrb, index is the 1-60 slot within it (see
+	// buildBankMenu for how the two get encoded into each item's
+	// BMessage). Swaps
+	// rkr->Bank[] to the requested file (loadbank()) and applies the
+	// requested slot from it (Bank_to_Preset()) -- both of which, via
+	// Actualizar_Audio(), need the same Convolotron handling as Load
+	// Preset, hence RunEngineActionFileSafe() instead of a bare lock.
+	void ApplyBankPreset(int32 bank, int32 index)
+	{
+		if (!fRkr)
+			return;
+		static const char* kBankFileNames[3] = {
+			"Default.rkrb", "Extra.rkrb", "Extra1.rkrb"
+		};
+		if (bank < 0 || bank > 2)
+			return;
+		char path[256];
+		snprintf(path, sizeof(path), "%s/%s", DATADIR, kBankFileNames[bank]);
+		std::string pathStr(path);
+		RKR* rkr = fRkr;
+
+		RunEngineActionFileSafe(rkr, [rkr, pathStr, index]() {
+			if (rkr->loadbank((char*)pathStr.c_str()))
+				rkr->Bank_to_Preset(index);
+		});
+
+		RefreshPresetName();
+		RefreshEffectBoxes(kPresetRefreshEffectIds);
+		RefreshEffectVisibility();
+	}
+
+	// Handles the header's Random Preset button (MSG_RANDOM_PRESET) --
+	// same algorithm as rakarrack.cxx's own RKRGUI::RandomPreset(): reset
+	// to a blank rack, pick 1-6 as how many of ten randomly-chosen, unique
+	// effects end up active, shuffle those ten into efx_order[], and give
+	// each of the ten (active or not, matching the FLTK original) a random
+	// pick from its own Preset dropdown via fPresetAppliers.
+	void ApplyRandomPreset()
+	{
+		if (!fRkr)
+			return;
+		RKR* rkr = fRkr;
+
+		RunEngineActionFileSafe(rkr, [rkr]() {
+			rkr->New();
+		});
+
+		int numEff = (int)(RND * 6) + 1;
+		int selEff[kOrderSlotCount];
+		selEff[0] = (int)(RND * rkr->NumEffects);
+		for (int i = 1; i < kOrderSlotCount; i++) {
+			bool unique;
+			do {
+				selEff[i] = (int)(RND * rkr->NumEffects);
+				unique = true;
+				for (int j = 0; j < i; j++) {
+					if (selEff[j] == selEff[i]) {
+						unique = false;
+						break;
+					}
+				}
+			} while (!unique);
+		}
+
+		pthread_mutex_lock(&jmutex);
+		for (int i = 0; i < kOrderSlotCount; i++)
+			rkr->efx_order[i] = selEff[i];
+		for (int i = 0; i < kOrderSlotCount; i++) {
+			int id = selEff[i];
+			int* bypass = BypassPtrForId(rkr, id);
+			if (bypass)
+				*bypass = (i < numEff) ? 1 : 0;
+			auto it = fPresetAppliers.find(id);
+			if (it != fPresetAppliers.end() && it->second.count > 0) {
+				int32 pick = (int32)(RND * it->second.count);
+				if (pick >= it->second.count)
+					pick = it->second.count - 1;
+				// Convolotron's own apply() unlocks/relocks internally if
+				// id==29 -- see that PresetMenuDef's own comment -- which
+				// is safe to nest inside this lock exactly like it is when
+				// Dispatch() invokes it directly.
+				it->second.apply(pick);
+			}
+		}
+		rkr->Bypass = 1;
+		pthread_mutex_unlock(&jmutex);
+
+		if (fMasterFX)
+			fMasterFX->SetValue(B_CONTROL_ON);
+		RefreshEffectBoxes(kPresetRefreshEffectIds);
+		RefreshEffectVisibility();
+	}
+};
+
+class RakarrackWindow : public BWindow {
+public:
+	RakarrackWindow(BRect frame, RKR* rkr)
+		:
+		BWindow(frame, "Haikurack", B_DOCUMENT_WINDOW,
+			B_ASYNCHRONOUS_CONTROLS | B_QUIT_ON_WINDOW_CLOSE),
+		fRkr(rkr)
+	{
+		SetLayout(new BGroupLayout(B_VERTICAL));
+
+		fMainView = new RakarrackView(rkr);
+		fMainView->SetExplicitMinSize(BSize(300, 200));
+
+		// Header (logo, CPU/FX Engine/Boost, Input Gain/Master Volume,
+		// Effects Order, Save/Load Preset) lives outside the BScrollView
+		// entirely, as its own sibling view, so none of it scrolls away
+		// with the effect racks -- see RakarrackView::BuildHeader().
+		BGroupView* header = new BGroupView(B_VERTICAL, 0);
+		fMainView->Themes().Add(header, kRoleBg);
+		fMainView->BuildHeader(header);
+
+		// No visible scroll bars -- see RakarrackView::MessageReceived()
+		// for how scrolling still works (mouse wheel) without them.
+		BScrollView* scroller = new BScrollView("rack_scroll", fMainView, 0,
+			false, false);
+		fMainView->Themes().Add(scroller, kRoleBg);
+
+		BLayoutBuilder::Group<>(this, B_VERTICAL, 0)
+			.Add(header)
+			.Add(scroller)
+			.End();
+
+		SetSizeLimits(200, 10000, 150, 10000);
+		SetPulseRate(50000);
+	}
+
+	virtual void MessageReceived(BMessage* msg)
+	{
+		if (msg->what == MSG_OPEN_ORDER) {
+			// Deliberately outside jmutex -- see MSG_OPEN_ORDER's
+			// declaration comment.
+			fMainView->OpenOrderWindow();
+			return;
+		}
+
+		if (msg->what == MSG_SAVE_PRESET) {
+			ShowSavePanel();
+			return;
+		}
+
+		if (msg->what == MSG_LOAD_PRESET) {
+			ShowLoadPanel();
+			return;
+		}
+
+		if (msg->what == MSG_BANK_PRESET) {
+			// Deliberately outside jmutex -- ApplyBankPreset() takes it
+			// itself via RunEngineActionFileSafe(). See MSG_BANK_PRESET's
+			// own declaration comment for why routing this through the
+			// already-locked MSG_ACTION path would deadlock instead.
+			int32 bank, index;
+			if (msg->FindInt32("bank", &bank) == B_OK
+				&& msg->FindInt32("index", &index) == B_OK) {
+				fMainView->ApplyBankPreset(bank, index);
+			}
+			return;
+		}
+
+		if (msg->what == MSG_RANDOM_PRESET) {
+			fMainView->ApplyRandomPreset();
+			return;
+		}
+
+		if (msg->what == B_COLORS_UPDATED) {
+			// The user changed their system colors (Appearance
+			// preferences). Rebuild the theme from them and recolor
+			// everything in place. Native controls (checkbox/menu/button
+			// text and frames) already follow the system colors on their
+			// own; this covers every color this file sets itself.
+			// Deliberately outside jmutex -- nothing here touches engine
+			// state.
+			BuildThemeFromSystemColors(&gTheme, msg);
+			fMainView->ApplyTheme();
+			return;
+		}
+
+		if (msg->what == B_SAVE_REQUESTED) {
+			HandleSaveRequested(msg);
+			return;
+		}
+
+		if (msg->what == B_REFS_RECEIVED) {
+			HandleRefsReceived(msg);
+			return;
+		}
+
+		if (msg->what != MSG_ACTION) {
+			BWindow::MessageReceived(msg);
+			return;
+		}
+
+		pthread_mutex_lock(&jmutex);
+		fMainView->Dispatch(msg);
+		pthread_mutex_unlock(&jmutex);
+	}
+
+private:
+	// Lazily built, kept for the life of the window (BFilePanel is heavy
+	// enough to build once and reuse, same reasoning as OrderWindow).
+	// Targeted at "this" explicitly rather than left at BFilePanel's
+	// default (be_app), so the resulting B_SAVE_REQUESTED/B_REFS_RECEIVED
+	// land in this window's own MessageReceived() above, not wherever
+	// BApplication's default handling of those would send them.
+	void ShowSavePanel()
+	{
+		if (!fSavePanel)
+			fSavePanel = new BFilePanel(B_SAVE_PANEL, new BMessenger(this));
+		fSavePanel->Show();
+	}
+
+	void ShowLoadPanel()
+	{
+		if (!fOpenPanel)
+			fOpenPanel = new BFilePanel(B_OPEN_PANEL, new BMessenger(this));
+		fOpenPanel->Show();
+	}
+
+	// rkr->savefile()/loadfile() (declared in src/global.h) are exactly
+	// what src/rakarrack.cxx's own File > Save/Load menu items call --
+	// same file format, same engine entry points, nothing native-mode-
+	// specific about the save/load mechanism itself, just how it's
+	// triggered. Both mutate/read a large amount of engine state the
+	// audio thread also touches every callback, so both need jmutex held,
+	// unlike the panel-opening steps above.
+	void HandleSaveRequested(BMessage* msg)
+	{
+		entry_ref dirRef;
+		BString name;
+		if (msg->FindRef("directory", &dirRef) != B_OK
+			|| msg->FindString("name", &name) != B_OK) {
+			return;
+		}
+		BPath dirPath(&dirRef);
+		BPath filePath(dirPath.Path(), name.String());
+
+		pthread_mutex_lock(&jmutex);
+		fRkr->savefile((char*)filePath.Path());
+		pthread_mutex_unlock(&jmutex);
+	}
+
+	void HandleRefsReceived(BMessage* msg)
+	{
+		entry_ref ref;
+		if (msg->FindRef("refs", &ref) != B_OK)
+			return;
+		BPath filePath(&ref);
+
+		// loadfile() restores Convolotron the same way setpreset() does --
+		// an 11-parameter changepar() loop that, for param 8 (the IR file),
+		// means setfile(): disk I/O plus a Blackman-window/normalization
+		// pass. Left alone, that runs inside the jmutex lock, same flood as
+		// the Preset/IR dropdowns before they were split into prefetchIR()/
+		// commitIR() (see Convolotron.h). loadfile() itself is shared with
+		// the FLTK build and has no idea jmutex exists, so
+		// RunEngineActionFileSafe() suppresses that one param instead
+		// (changepar(8, ...) just remembers the value while suppressed) and
+		// applies it the same unlocked-read/locked-commit way as those
+		// dropdowns once loadfile() itself is done.
+		RunEngineActionFileSafe(fRkr, [this, &filePath]() {
+			fRkr->loadfile((char*)filePath.Path());
+		});
+
+		// The engine and audio output switch to the loaded preset
+		// immediately; every widget was only ever primed once, at its own
+		// construction, so without this the on-screen positions would keep
+		// showing whatever was there before the load. kPresetRefreshEffectIds
+		// now covers every effect (see that list's own comment), so this
+		// catches all of them, not just the original nine -- no more "won't
+		// catch up until restarted" alert needed for the mismatch that used
+		// to leave. Plain int reads (getpar() and friends), same as
+		// BuildEffectBox's own construction-time priming, so no lock needed
+		// here either. Preset_Name is also set by loadfile() itself (from
+		// the file's own saved name), so the header's "Current Preset:"
+		// label picks up a manually-loaded preset's name here too.
+		fMainView->RefreshEffectBoxes(kPresetRefreshEffectIds);
+		fMainView->RefreshPresetName();
+	}
+
+	RKR* fRkr;
+	RakarrackView* fMainView;
+	BFilePanel* fSavePanel = nullptr;
+	BFilePanel* fOpenPanel = nullptr;
+};
+
+extern "C" void start_haiku_native_interface(void* rkr_ptr) {
+    RKR* rkr = (RKR*)rkr_ptr;
+    // The user's current system colors -- must happen before any view is
+    // built, since every view takes its initial colors from gTheme.
+    BuildThemeFromSystemColors(&gTheme);
+    RakarrackWindow *win = new RakarrackWindow(BRect(80, 60, 1080, 760), rkr);
+    win->Show();
+}

@@ -1,0 +1,87 @@
+SUMMARY="A richly featured multi-effects processor for guitar"
+DESCRIPTION="Rakarrack emulates a guitar effects pedalboard. Effects include \
+compressor, expander, noise gate, graphic and parametric equalizers, exciter, \
+shuffle, convolotron, valve, flanger, dual flange, chorus, musical delay, \
+arpie, echo with reverse playback, reverb, digital and analogic phasers, \
+synthfilter, varyband, ring, wah-wah, alien-wah, mutromojo, harmonizer, \
+infinity, looper and four flexible distortion modules including sub-octave \
+modulation and dirty octave up. Most of the effects engine is built from \
+modules found in the ZynAddSubFX software synthesizer.
+
+This is the Haiku port of Rakarrack 0.6.2. It uses the Haiku Media Kit for \
+audio and the MIDI2 Kit for MIDI instead of JACK and ALSA."
+HOMEPAGE="https://github.com/ablyssx74/rakarrack-haiku-2011"
+COPYRIGHT="2008-2011 Josep Andreu, Ryan Billing and others
+	2026 ablyss (Haiku port)"
+LICENSE="GNU GPL v2"
+REVISION="1"
+# Replace <commit> with the revision to package once it is pushed.
+SOURCE_URI="git+https://github.com/ablyssx74/rakarrack-haiku-2011.git#<commit>"
+SOURCE_DIR="rakarrack-haiku-2011"
+
+ARCHITECTURES="all !x86_gcc2"
+SECONDARY_ARCHITECTURES=""
+
+PROVIDES="
+	rakarrack = $portVersion
+	app:Rakarrack = $portVersion
+	cmd:rakarrack = $portVersion
+	"
+REQUIRES="
+	haiku
+	lib:libfftw3
+	lib:libfltk
+	lib:libcurl
+	lib:libpng16
+	lib:libsamplerate
+	lib:libsndfile
+	lib:libz
+	"
+
+BUILD_REQUIRES="
+	haiku_devel
+	devel:libfftw3
+	devel:libfltk
+	devel:libfontconfig
+	devel:libfreetype
+	devel:libcurl
+	devel:libsamplerate
+	devel:libsndfile
+	devel:libXpm
+	devel:libXfont2
+	"
+BUILD_PREREQUIRES="
+	cmd:aclocal
+	cmd:autoconf
+	cmd:automake
+	cmd:fltk_config
+	cmd:g++
+	cmd:make
+	cmd:pkg_config
+	"
+
+BUILD()
+{
+	# haiku.makefile drives configure + the (non-automake) link, and embeds
+	# the app resources (rakarrack.rdef) into the binary.
+	make -f haiku.makefile config build
+}
+
+INSTALL()
+{
+	# These must match the --datadir/--docdir compiled in by `config`
+	# in haiku.makefile (/boot/system/data/rakarrack/share/...).
+	share=$dataDir/rakarrack/share
+
+	mkdir -p $appsDir $binDir $manDir/man1
+	mkdir -p $share/rakarrack $share/doc/rakarrack
+
+	cp rakarrack $appsDir/Rakarrack
+	ln -s ../apps/Rakarrack $binDir/rakarrack
+	addAppDeskbarSymlink $appsDir/Rakarrack Rakarrack
+
+	cp data/*.{rvb,dly,rkrb,wav} $share/rakarrack
+	cp -r doc/help $share/doc/rakarrack/html
+	cp AUTHORS COPYING ChangeLog NEWS $share/doc/rakarrack
+	cp man/rakarrack.1 $manDir/man1
+}
