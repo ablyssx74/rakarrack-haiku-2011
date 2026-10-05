@@ -23,65 +23,73 @@ SOURCE_URI="https://github.com/ablyssx74/rakarrack-haiku-2011/archive/refs/tags/
 CHECKSUM_SHA256="<sha256 of the tag tarball>"
 SOURCE_DIR="rakarrack-haiku-2011-$portVersion-$REVISION"
 
+# GCC13 only. On a 32-bit hybrid (x86_gcc2h) the primary x86_gcc2 build is
+# excluded and the app is built as the secondary-architecture package
+# rakarrack_x86 instead (haikuporter rakarrack_x86). On 64-bit and on a pure
+# 32-bit (x86) Haiku it is the plain rakarrack package.
 ARCHITECTURES="all !x86_gcc2"
-SECONDARY_ARCHITECTURES=""
+SECONDARY_ARCHITECTURES="x86"
 
 PROVIDES="
-	rakarrack = $portVersion
-	app:Rakarrack = $portVersion
-	cmd:rakarrack = $portVersion
+	rakarrack$secondaryArchSuffix = $portVersion
+	app:Rakarrack$secondaryArchSuffix = $portVersion
+	cmd:rakarrack$secondaryArchSuffix = $portVersion
 	"
 REQUIRES="
-	haiku
-	lib:libfftw3
-	lib:libfltk
-	lib:libcurl
-	lib:libpng16
-	lib:libsamplerate
-	lib:libsndfile
-	lib:libz
+	haiku$secondaryArchSuffix
+	lib:libfftw3$secondaryArchSuffix
+	lib:libfltk$secondaryArchSuffix
+	lib:libcurl$secondaryArchSuffix
+	lib:libpng16$secondaryArchSuffix
+	lib:libsamplerate$secondaryArchSuffix
+	lib:libsndfile$secondaryArchSuffix
+	lib:libz$secondaryArchSuffix
 	"
 
 BUILD_REQUIRES="
-	haiku_devel
-	devel:libfftw3
-	devel:libfltk
-	devel:libfontconfig
-	devel:libfreetype
-	devel:libcurl
-	devel:libsamplerate
-	devel:libsndfile
-	devel:libXpm
-	devel:libXfont2
+	haiku${secondaryArchSuffix}_devel
+	devel:libfftw3$secondaryArchSuffix
+	devel:libfltk$secondaryArchSuffix
+	devel:libfontconfig$secondaryArchSuffix
+	devel:libfreetype$secondaryArchSuffix
+	devel:libcurl$secondaryArchSuffix
+	devel:libsamplerate$secondaryArchSuffix
+	devel:libsndfile$secondaryArchSuffix
+	devel:libXpm$secondaryArchSuffix
+	devel:libXfont2$secondaryArchSuffix
 	"
 BUILD_PREREQUIRES="
 	cmd:aclocal
 	cmd:autoconf
 	cmd:automake
-	cmd:fltk_config
-	cmd:g++
+	cmd:fltk_config$secondaryArchSuffix
+	cmd:g++$secondaryArchSuffix
 	cmd:make
-	cmd:pkg_config
+	cmd:pkg_config$secondaryArchSuffix
 	"
 
 BUILD()
 {
 	# haiku.makefile drives configure + the (non-automake) link, and embeds
-	# the app resources (rakarrack.rdef) into the binary.
+	# the app resources (rakarrack.rdef) into the binary. It picks the 32-bit
+	# toolchain/library paths itself when run on a 32-bit Haiku.
 	make -f haiku.makefile config build
 }
 
 INSTALL()
 {
 	# These must match the --datadir/--docdir compiled in by `config`
-	# in haiku.makefile (/boot/system/data/rakarrack/share/...).
+	# in haiku.makefile (/boot/system/data/rakarrack/share/...); the app
+	# also looks them up at runtime from wherever its package is installed.
 	share=$dataDir/rakarrack/share
 
 	mkdir -p $appsDir $binDir $manDir/man1
 	mkdir -p $share/rakarrack $share/doc/rakarrack
 
 	cp rakarrack $appsDir/Rakarrack
-	ln -s ../apps/Rakarrack $binDir/rakarrack
+	# bin is bin/ on the primary architecture but bin/x86/ for a secondary
+	# one, so compute the link target instead of hard-coding ../apps.
+	ln -s "$(realpath --relative-to=$binDir $appsDir)/Rakarrack" $binDir/rakarrack
 	addAppDeskbarSymlink $appsDir/Rakarrack Rakarrack
 
 	cp data/*.{rvb,dly,rkrb,wav} $share/rakarrack
