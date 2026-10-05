@@ -64,8 +64,8 @@ BUILD_PREREQUIRES="
 	cmd:aclocal
 	cmd:autoconf
 	cmd:automake
-	cmd:fltk_config$secondaryArchSuffix
-	cmd:g++$secondaryArchSuffix
+	cmd:gcc$secondaryArchSuffix
+	cmd:ld$secondaryArchSuffix
 	cmd:make
 	cmd:pkg_config$secondaryArchSuffix
 	"
