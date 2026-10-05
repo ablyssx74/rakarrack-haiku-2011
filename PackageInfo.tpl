@@ -9,7 +9,8 @@ licenses {
 	"GNU GPL v2"
 }
 copyrights {
-	"$(YEAR) Rakarrack project"
+	"2008-2011 Josep Andreu, Ryan Billing and others"
+	"$(YEAR) ablyss (Haiku port)"
 }
 provides {
 	$(NAME) = $(VERSION)-$(REVISION)
