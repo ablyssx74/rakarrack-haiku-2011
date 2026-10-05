@@ -27,7 +27,7 @@ requires {
 	lib:libcurl$(is32bit)
 }	
 urls {
-	"https://github.com/ablyssx74/rakarrack-haiku"
+	"https://github.com/ablyssx74/rakarrack-haiku-2011"
 }
 source-urls {
 # Download
