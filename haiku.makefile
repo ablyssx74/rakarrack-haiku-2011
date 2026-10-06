@@ -109,7 +109,7 @@ build: haiku_stubs.o haiku_native/haiku-rakarrack.o
 	@echo "=========================================================="
 	touch configure.in aclocal.m4 Makefile.am Makefile.in configure config.status
 	-$(MAKE) -j4 -k \
-		CXXFLAGS="-include $(PWD)/jack/jack.h $(HAIKU_FIXES) $(FLTK_CXX) $(BUILD_FLAGS) -fpermissive -I. -I$(PWD)/jack" \
+		CXXFLAGS="-include $(PWD)/jack/jack.h $(HAIKU_FIXES) -DHAIKU_PORT_REVISION=$(REVISION) $(FLTK_CXX) $(BUILD_FLAGS) -fpermissive -I. -I$(PWD)/jack" \
 		LIBS="$(PWD)/haiku_native/haiku-rakarrack.o $(FLTK_LD) $(EXTRA_LIBS) $(HAIKU_LIBS) $(LD_OPTIMIZE) $(PWD)/haiku_stubs.o -Wno-int-to-pointer-cast -Wno-write-strings"
 	# The final link now combines everything correctly
 	$(CXX) -o rakarrack src/*.o haiku_stubs.o haiku_native/haiku-rakarrack.o \

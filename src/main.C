@@ -47,8 +47,33 @@
 
 bool gDebugMode = false;
 
+// The port's revision number (REVISION in haiku.makefile, passed in as
+// -DHAIKU_PORT_REVISION) and the upstream version (PACKAGE_VERSION from
+// configure) together give e.g. "v0.6.2-1" -- the same format as the VERSION
+// file the update checker below compares against, so there is nothing to
+// edit here when a new revision is released.
+#ifndef HAIKU_PORT_REVISION
+#define HAIKU_PORT_REVISION 1
+#endif
+#define RKR_STRINGIFY2(x) #x
+#define RKR_STRINGIFY(x) RKR_STRINGIFY2(x)
 namespace AppInfo {
-    static const char* const VERSION_STRING = "Rakarrack v14 (Haiku OS)";
+    static const char* const VERSION_STRING =
+        "Rakarrack v" PACKAGE_VERSION "-" RKR_STRINGIFY(HAIKU_PORT_REVISION) " (Haiku OS)";
+}
+
+// Pulls "major.minor.patch-revision" (revision optional) out of the first
+// number found in `text`, e.g. "v0.6.2-1" or "Rakarrack v0.6.2-1 (Haiku OS)".
+static int32 ParseVersionFlattened(const char* text) {
+    int major = 0, minor = 0, patch = 0, revision = 0;
+    const char* p = text;
+    while (*p != '\0' && (*p < '0' || *p > '9'))
+        p++;
+    // Anything that isn't a real x.y.z (e.g. an HTML "404: Not Found" page
+    // from a failed download) counts as no version at all.
+    if (sscanf(p, "%d.%d.%d-%d", &major, &minor, &patch, &revision) < 3)
+        return 0;
+    return (int32)(major * 1000000 + minor * 10000 + patch * 100 + revision);
 }
 
 
@@ -79,7 +104,7 @@ static int32 BackgroundUpdateChecker(void* data) {
 
     if (gDebugMode) printf("[DEBUG_UPDATE] Asynchronous curl update checker running...\n");
 
-    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/rakarrack-haiku/refs/heads/main/VERSION";
+    const char* targetUrl = "https://raw.githubusercontent.com/ablyssx74/rakarrack-haiku-2011/refs/heads/main/VERSION";
 
     std::string responseBuffer;
     BString remoteVersionStr = "";
@@ -104,29 +129,9 @@ static int32 BackgroundUpdateChecker(void* data) {
         BString currentVersionStr = AppInfo::VERSION_STRING;
         if (gDebugMode) printf("[DEBUG_UPDATE] Local AppInfo text before cleaning: '%s'\n", currentVersionStr.String());
 
-        int32 curMajor = 0, curMinor = 0, curRevision = 0;
-        int32 remMajor = 0, remMinor = 0, remRevision = 0;
-
-        // --- Bulletproof sscanf Pattern Matching ---
-        // Looks for a 'v' immediately followed by a number, bypassing words like "HaikuDVR" or "Version"
-        if (sscanf(currentVersionStr.String(), "%*[^v]v%d.%d.%d", &curMajor, &curMinor, &curRevision) != 3) {
-            // Fallback: search for raw dot-separated numbers anywhere if 'v' isn't found
-            sscanf(currentVersionStr.String(), "%*[^0-9]%d.%d.%d", &curMajor, &curMinor, &curRevision);
-        }
-
-        // Parse the remote string from GitHub using the same pattern rules
-        if (sscanf(remoteVersionStr.String(), "%*[^v]v%d.%d.%d", &remMajor, &remMinor, &remRevision) != 3) {
-            sscanf(remoteVersionStr.String(), "%*[^0-9]%d.%d.%d", &remMajor, &remMinor, &remRevision);
-        }
-
-        // Log the cleaned string results visually just for your debug logs
-        if (gDebugMode) {
-            printf("[DEBUG_UPDATE] Cleaned local target string: '%d.%d.%d'\n", curMajor, curMinor, curRevision);
-        }
-
-        // Flatten values down into integers for math checks
-        int32 currentFlattened = (curMajor * 10000) + (curMinor * 100) + curRevision;
-        int32 remoteFlattened  = (remMajor * 10000) + (remMinor * 100) + remRevision;
+        // Flatten both versions down into integers for the math check
+        int32 currentFlattened = ParseVersionFlattened(currentVersionStr.String());
+        int32 remoteFlattened  = ParseVersionFlattened(remoteVersionStr.String());
 
         if (gDebugMode) {
             printf("[DEBUG_UPDATE] Calculated values for math match -> Local: %d | Remote: %d\n", 
