@@ -98,4 +98,8 @@ INSTALL()
 	cp -r doc/help $share/doc/rakarrack/html
 	cp AUTHORS COPYING ChangeLog NEWS $share/doc/rakarrack
 	cp man/rakarrack.1 $manDir/man1
+
+	# Plain files, not programs: upstream ships many of them with the executable
+	# bit set, and Haiku then tries to run help.html instead of opening it.
+	find $share $manDir -type f -exec chmod 644 {} +
 }

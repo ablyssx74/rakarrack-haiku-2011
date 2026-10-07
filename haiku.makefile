@@ -187,6 +187,10 @@ package: all
 	cp  COPYING $(PACKAGE_DIR)/data/$(NAME)/share/doc/$(NAME)/
 	cp  ChangeLog $(PACKAGE_DIR)/data/$(NAME)/share/doc/$(NAME)/
 	cp  NEWS $(PACKAGE_DIR)/data/$(NAME)/share/doc/$(NAME)/
+	# Data, docs and man pages are plain files. Upstream ships many of them with
+	# the executable bit set, and Haiku then tries to *run* help.html instead of
+	# opening it in the browser ("File is mistakenly marked as executable").
+	find $(PACKAGE_DIR)/data $(PACKAGE_DIR)/documentation -type f -exec chmod 644 {} +
 	cp  man/rakarrack.1 $(PACKAGE_DIR)/documentation/man/man1/
 	cp $(NAME) $(PACKAGE_DIR)/apps/$(NAME)
 	ln -s ../apps/$(NAME) $(PACKAGE_DIR)/bin/rakarrack

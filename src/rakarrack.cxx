@@ -1095,8 +1095,21 @@ void RKRGUI::cb_ACI_Menu(Fl_Menu_* o, void* v) {
   ((RKRGUI*)(o->parent()->user_data()))->cb_ACI_Menu_i(o,v);
 }
 
+// Window geometry to go back to when leaving fullscreen.
+static int sWindowedX = 0, sWindowedY = 0, sWindowedW = 0, sWindowedH = 0;
+
 void RKRGUI::cb_Fullscreen_i(Fl_Menu_*, void*) {
-  Principal->fullscreen();
+  // F12 / View -> Fullscreen is a toggle: upstream only ever entered
+  // fullscreen, so there was no way back out.
+  if (Principal->fullscreen_active()) {
+    Principal->fullscreen_off(sWindowedX, sWindowedY, sWindowedW, sWindowedH);
+  } else {
+    sWindowedX = Principal->x();
+    sWindowedY = Principal->y();
+    sWindowedW = Principal->w();
+    sWindowedH = Principal->h();
+    Principal->fullscreen();
+  }
 }
 void RKRGUI::cb_Fullscreen(Fl_Menu_* o, void* v) {
   ((RKRGUI*)(o->parent()->user_data()))->cb_Fullscreen_i(o,v);
@@ -24818,8 +24831,15 @@ void RKRGUI::show_help() {
 
     entry_ref ref;
     if (get_ref_for_path(temp, &ref) == B_OK) {
-        // This tells Haiku to "open" the file just like double-clicking it
-        be_roster->Launch(&ref);
+        // Ask the preferred handler for HTML (the default web browser) to
+        // open the page. Launch(&ref) alone is not enough: if the file has
+        // its executable bit set (as upstream's help pages do) Haiku tries
+        // to *run* it and fails with "File is mistakenly marked as
+        // executable".
+        BMessage refsMessage(B_REFS_RECEIVED);
+        refsMessage.AddRef("refs", &ref);
+        if (be_roster->Launch("text/html", &refsMessage) != B_OK)
+            be_roster->Launch(&ref);
     } else {
         printf("Error: Could not find help file at %s\n", temp);
     }
