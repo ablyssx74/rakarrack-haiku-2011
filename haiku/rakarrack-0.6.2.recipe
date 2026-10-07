@@ -20,7 +20,7 @@ REVISION="3"
 # CHECKSUM_SHA256 is the sha256sum of that tag's tarball -- a new tag needs a
 # new checksum.
 SOURCE_URI="https://github.com/ablyssx74/rakarrack-haiku-2011/archive/refs/tags/v$portVersion-$REVISION.tar.gz"
-CHECKSUM_SHA256="<sha256 of the v0.6.2-3 tag tarball>"
+CHECKSUM_SHA256="ae68e9fd9e05178b38ce7d2f8254d67210cf5dd9665d8ee4d4592236a95523dc"
 SOURCE_DIR="rakarrack-haiku-2011-$portVersion-$REVISION"
 
 # GCC13 only. On a 32-bit hybrid (x86_gcc2h) the primary x86_gcc2 build is not
