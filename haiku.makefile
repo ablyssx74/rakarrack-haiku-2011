@@ -5,8 +5,12 @@ SHELL := /bin/bash
 
 PACKAGE_DIR := build/package
 NAME = rakarrack
-VERSION = 0.6.2
-REVISION = 4
+# The one place a release changes is the VERSION file (e.g. v0.6.2-4: the upstream version and the port's revision): the package and
+# the program's own version (which the update check compares with the VERSION file on GitHub) take it from there.
+# (The HaikuPorts recipe in haiku/ has its own REVISION and checksum.)
+FULL_VERSION := $(shell tr -d 'v \r\n' < VERSION)
+VERSION := $(firstword $(subst -, ,$(FULL_VERSION)))
+REVISION := $(word 2,$(subst -, ,$(FULL_VERSION)))
 
 UNAME_M := $(shell uname -m)
 ifeq ($(UNAME_M), BePC)
@@ -108,6 +112,7 @@ build: haiku_stubs.o haiku_native/haiku-rakarrack.o
 	@echo "      Building Rakarrack for Haiku $(SIMD_FLAGS)"
 	@echo "=========================================================="
 	touch configure.in aclocal.m4 Makefile.am Makefile.in configure config.status
+	touch src/main.C   # the version is compiled into it: a new VERSION means a new build of it
 	-$(MAKE) -j4 -k \
 		CXXFLAGS="-include $(PWD)/jack/jack.h $(HAIKU_FIXES) -DHAIKU_PORT_REVISION=$(REVISION) $(FLTK_CXX) $(BUILD_FLAGS) -fpermissive -I. -I$(PWD)/jack" \
 		LIBS="$(PWD)/haiku_native/haiku-rakarrack.o $(FLTK_LD) $(EXTRA_LIBS) $(HAIKU_LIBS) $(LD_OPTIMIZE) $(PWD)/haiku_stubs.o -Wno-int-to-pointer-cast -Wno-write-strings"
